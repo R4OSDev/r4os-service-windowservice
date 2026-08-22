@@ -69,24 +69,27 @@ fn runService(ctx: *const r4os.r4sys.Context) i32 {
 
     var state = ServiceState{};
     setLastError(&state, "ready");
-    while (!ctx.programShouldClose()) {
-        const poll = ctx.serviceEndpointPoll(handle);
-        if (poll < 0) {
-            clearAll(&state, "endpoint");
-            _ = ctx.serviceEndpointUnregister(handle);
-            return poll;
-        }
-        if (poll > 0) {
-            const rc = handleRequest(ctx, handle, &state);
-            if (rc < 0) {
+    var service_loop = r4os.ServiceLoop.init(ctx.*, handle, .{});
+    while (true) {
+        switch (service_loop.wait(null)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ ctx, handle, &state });
+                if (rc >= 0) continue;
                 clearAll(&state, "request");
                 _ = ctx.serviceEndpointUnregister(handle);
                 return rc;
-            }
+            },
+            .idle, .deadline => {},
+            .stop => break,
+            .failure => |raw| {
+                clearAll(&state, "endpoint");
+                _ = ctx.serviceEndpointUnregister(handle);
+                return raw;
+            },
         }
-        ctx.sleepTicks(1);
     }
 
+    service_loop.report(service_name);
     clearAll(&state, "service-stop");
     _ = ctx.serviceEndpointUnregister(handle);
     ctx.println("WINSVC stopped cleanly");
