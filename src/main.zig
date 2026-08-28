@@ -1,9 +1,15 @@
+const std = @import("std");
 const r4os = @import("r4os");
+const tray_broker = @import("tray_broker.zig");
 
 const service_name = "WINSVC";
 const selftest_arg = "/SELFTEST";
 const ping_arg = "/PING";
 const service_timeout_ticks: u64 = 120;
+const tray_owner_sweep_ticks: u64 = 50;
+const program_role_shell: u8 = 1;
+const program_class_gui: u8 = 1;
+const program_state_done: u8 = 2;
 
 const Slot = struct {
     used: bool = false,
@@ -30,6 +36,8 @@ const ServiceState = struct {
     bad_requests: u64 = 0,
     last_error: [r4os.abi.window_service_error_bytes]u8 = .{0} ** r4os.abi.window_service_error_bytes,
     slots: [r4os.abi.window_service_max_windows]Slot = .{Slot{}} ** r4os.abi.window_service_max_windows,
+    tray: tray_broker.Broker = .{},
+    next_tray_owner_sweep_tick: u64 = 0,
 };
 
 var service_payload: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4os.abi.service_api_max_payload;
@@ -68,16 +76,18 @@ fn runService(ctx: *const r4os.r4sys.Context) i32 {
     }
 
     var state = ServiceState{};
+    state.next_tray_owner_sweep_tick = ctx.ticks() +| tray_owner_sweep_ticks;
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(ctx.*, handle, .{});
     while (true) {
-        switch (service_loop.wait(null)) {
+        switch (service_loop.wait(nextServiceDeadline(&state))) {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleRequest, .{ ctx, handle, &state });
-                if (rc >= 0) continue;
-                clearAll(&state, "request");
-                _ = ctx.serviceEndpointUnregister(handle);
-                return rc;
+                if (rc < 0) {
+                    clearAll(&state, "request");
+                    _ = ctx.serviceEndpointUnregister(handle);
+                    return rc;
+                }
             },
             .idle, .deadline => {},
             .stop => break,
@@ -87,6 +97,7 @@ fn runService(ctx: *const r4os.r4sys.Context) i32 {
                 return raw;
             },
         }
+        maintainTray(ctx, handle, &state);
     }
 
     service_loop.report(service_name);
@@ -122,12 +133,147 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.window_service_op_stale_sweep,
         r4os.abi.window_service_op_restart_cleanup,
         => replyAction(ctx, handle, header.request_id, state, header.op, request),
+        r4os.abi.tray_service_op_status,
+        r4os.abi.tray_service_op_upsert,
+        r4os.abi.tray_service_op_remove,
+        r4os.abi.tray_service_op_wait_event,
+        => replyTrayProvider(ctx, handle, header, state, request),
+        r4os.abi.tray_service_op_desktop_sync,
+        r4os.abi.tray_service_op_desktop_activate,
+        r4os.abi.tray_service_op_desktop_visibility,
+        => replyTrayDesktop(ctx, handle, header, state, request),
         else => {
             state.bad_ops +%= 1;
             setLastError(state, "bad-op");
             return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
         },
     };
+}
+
+fn nextServiceDeadline(state: *const ServiceState) ?u64 {
+    const owner_sweep = state.next_tray_owner_sweep_tick;
+    if (state.tray.nextDeadline()) |wait_deadline| return @min(owner_sweep, wait_deadline);
+    return owner_sweep;
+}
+
+fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceState) void {
+    const now = ctx.ticks();
+    if (now >= state.next_tray_owner_sweep_tick) {
+        state.next_tray_owner_sweep_tick = now +| tray_owner_sweep_ticks;
+        if (tray_broker.ownerValid(state.tray.desktop_owner) and processHandleGone(ctx, state.tray.desktop_owner)) {
+            _ = state.tray.clearDesktop();
+        }
+
+        var cursor: usize = 0;
+        while (state.tray.ownerAt(cursor)) |found| {
+            cursor = found.index + 1;
+            if (processHandleGone(ctx, found.owner)) _ = state.tray.removeOwner(found.owner);
+        }
+    }
+
+    var replies: usize = 0;
+    while (replies < tray_broker.max_owners) : (replies += 1) {
+        const reply = state.tray.takeWaitReply(now) orelse break;
+        const bytes: [*]const u8 = @ptrCast(&reply.response);
+        _ = ctx.serviceEndpointReply(handle, reply.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
+    }
+}
+
+fn processHandleGone(ctx: *const r4os.r4sys.Context, owner: r4os.abi.ProgramProcessHandle) bool {
+    var info: r4os.abi.ProgramInstanceInfo = .{};
+    const rc = ctx.programHandleStatus(&owner, &info);
+    if (rc == r4os.abi.program_handle_error_would_block) return false;
+    return rc != r4os.abi.program_handle_ok or info.id != owner.instance_id or info.state == program_state_done;
+}
+
+fn liveCaller(ctx: *const r4os.r4sys.Context, client_id: u32, owner: r4os.abi.ProgramProcessHandle) ?r4os.abi.ProgramInstanceInfo {
+    if (!tray_broker.ownerValid(owner) or client_id != owner.instance_id) return null;
+    var info: r4os.abi.ProgramInstanceInfo = .{};
+    if (ctx.programHandleStatus(&owner, &info) != r4os.abi.program_handle_ok or
+        info.id != owner.instance_id or info.state == program_state_done)
+    {
+        return null;
+    }
+    return info;
+}
+
+fn replyTrayProvider(
+    ctx: *const r4os.r4sys.Context,
+    handle: u32,
+    header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState,
+    payload: []const u8,
+) i32 {
+    const request = decodeFixed(r4os.abi.TrayServiceRequest, payload) orelse
+        return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYBAD");
+    var response: r4os.abi.TrayServiceResponse = undefined;
+    if (!tray_broker.validBaseRequest(&request)) {
+        response = .{ .result = r4os.abi.tray_result_bad_request, .owner = request.owner, .item_id = request.item_id, .capacity = @intCast(tray_broker.max_items), .desktop_epoch = state.tray.desktop_epoch, .registry_revision = state.tray.revision };
+    } else if (liveCaller(ctx, header.client_id, request.owner) == null) {
+        response = .{ .result = r4os.abi.tray_result_not_owner, .owner = request.owner, .item_id = request.item_id, .capacity = @intCast(tray_broker.max_items), .desktop_epoch = state.tray.desktop_epoch, .registry_revision = state.tray.revision };
+    } else switch (header.op) {
+        r4os.abi.tray_service_op_status => response = state.tray.status(request.owner, request.item_id),
+        r4os.abi.tray_service_op_upsert => response = state.tray.upsert(&request),
+        r4os.abi.tray_service_op_remove => response = state.tray.remove(request.owner, request.item_id),
+        r4os.abi.tray_service_op_wait_event => switch (state.tray.beginWait(
+            request.owner,
+            header.request_id,
+            request.after_sequence,
+            request.deadline_tick,
+            ctx.ticks(),
+        )) {
+            .parked => return 0,
+            .reply => |value| response = value,
+        },
+        else => unreachable,
+    }
+    return replyTrayResponse(ctx, handle, header.request_id, &response);
+}
+
+fn replyTrayDesktop(
+    ctx: *const r4os.r4sys.Context,
+    handle: u32,
+    header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState,
+    payload: []const u8,
+) i32 {
+    const request = decodeFixed(r4os.abi.TrayDesktopExchange, payload) orelse
+        return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYDESKBAD");
+    var response: r4os.abi.TrayDesktopExchange = undefined;
+    const caller = liveCaller(ctx, header.client_id, request.desktop_owner);
+    if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui) {
+        response = trayDesktopFailure(state, request.desktop_owner, r4os.abi.tray_result_not_owner);
+    } else response = switch (header.op) {
+        r4os.abi.tray_service_op_desktop_sync => state.tray.desktopSync(&request),
+        r4os.abi.tray_service_op_desktop_activate => state.tray.desktopActivate(&request),
+        r4os.abi.tray_service_op_desktop_visibility => state.tray.desktopVisibility(&request),
+        else => unreachable,
+    };
+    const bytes: [*]const u8 = @ptrCast(&response);
+    return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayDesktopExchange)]);
+}
+
+fn replyTrayResponse(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, response: *const r4os.abi.TrayServiceResponse) i32 {
+    const bytes: [*]const u8 = @ptrCast(response);
+    return ctx.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
+}
+
+fn trayDesktopFailure(state: *const ServiceState, owner: r4os.abi.ProgramProcessHandle, result: i32) r4os.abi.TrayDesktopExchange {
+    return .{
+        .desktop_owner = owner,
+        .result = result,
+        .registered_count = @intCast(state.tray.registered_count),
+        .capacity = @intCast(tray_broker.max_items),
+        .desktop_epoch = state.tray.desktop_epoch,
+        .registry_revision = state.tray.revision,
+    };
+}
+
+fn decodeFixed(comptime T: type, payload: []const u8) ?T {
+    if (payload.len != @sizeOf(T)) return null;
+    var value: T = undefined;
+    @memcpy(std.mem.asBytes(&value), payload);
+    return value;
 }
 
 fn replyTextStatus(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState) i32 {
