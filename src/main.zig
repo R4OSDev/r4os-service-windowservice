@@ -145,7 +145,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         else => {
             state.bad_ops +%= 1;
             setLastError(state, "bad-op");
-            return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
+            return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
         },
     };
 }
@@ -175,7 +175,7 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
     while (replies < tray_broker.max_owners) : (replies += 1) {
         const reply = state.tray.takeWaitReply(now) orelse break;
         const bytes: [*]const u8 = @ptrCast(&reply.response);
-        _ = ctx.serviceEndpointReply(handle, reply.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
+        _ = r4os.app_services.replyIfPending(ctx.*, handle, reply.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
     }
 }
 
@@ -205,7 +205,7 @@ fn replyTrayProvider(
     payload: []const u8,
 ) i32 {
     const request = decodeFixed(r4os.abi.TrayServiceRequest, payload) orelse
-        return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYBAD");
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYBAD");
     var response: r4os.abi.TrayServiceResponse = undefined;
     if (!tray_broker.validBaseRequest(&request)) {
         response = .{ .result = r4os.abi.tray_result_bad_request, .owner = request.owner, .item_id = request.item_id, .capacity = @intCast(tray_broker.max_items), .desktop_epoch = state.tray.desktop_epoch, .registry_revision = state.tray.revision };
@@ -238,7 +238,7 @@ fn replyTrayDesktop(
     payload: []const u8,
 ) i32 {
     const request = decodeFixed(r4os.abi.TrayDesktopExchange, payload) orelse
-        return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYDESKBAD");
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYDESKBAD");
     var response: r4os.abi.TrayDesktopExchange = undefined;
     const caller = liveCaller(ctx, header.client_id, request.desktop_owner);
     if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui) {
@@ -250,12 +250,12 @@ fn replyTrayDesktop(
         else => unreachable,
     };
     const bytes: [*]const u8 = @ptrCast(&response);
-    return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayDesktopExchange)]);
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayDesktopExchange)]);
 }
 
 fn replyTrayResponse(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, response: *const r4os.abi.TrayServiceResponse) i32 {
     const bytes: [*]const u8 = @ptrCast(response);
-    return ctx.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
 }
 
 fn trayDesktopFailure(state: *const ServiceState, owner: r4os.abi.ProgramProcessHandle, result: i32) r4os.abi.TrayDesktopExchange {
@@ -290,27 +290,27 @@ fn replyTextStatus(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32,
     writer.writeU64(status_reply.revision);
     writer.write(" last=");
     writer.write(spanZ(status_reply.last_error[0..]));
-    return ctx.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, writer.slice());
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, writer.slice());
 }
 
 fn replyStatus(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState) i32 {
     state.status_requests +%= 1;
     status_reply = makeStatus(state);
     const bytes: [*]const u8 = @ptrCast(&status_reply);
-    return ctx.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceStatus)]);
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceStatus)]);
 }
 
 fn replySnapshot(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState) i32 {
     state.snapshot_requests +%= 1;
     snapshot_reply = makeSnapshot(state);
     const bytes: [*]const u8 = @ptrCast(&snapshot_reply);
-    return ctx.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceSnapshot)]);
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceSnapshot)]);
 }
 
 fn replyAction(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState, op: u16, request: []const u8) i32 {
     result_reply = performAction(state, op, request);
     const bytes: [*]const u8 = @ptrCast(&result_reply);
-    return ctx.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceResult)]);
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceResult)]);
 }
 
 fn performAction(state: *ServiceState, op: u16, request: []const u8) r4os.abi.WindowServiceResult {
