@@ -148,6 +148,8 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.display_control_op_request,
         => replyDisplayClient(ctx, handle, header, state, request),
         r4os.abi.display_control_op_exchange => replyDisplayDesktop(ctx, handle, header, state, request),
+        r4os.abi.display_control_op_color_request => replyDisplayColorClient(ctx, handle, header, state, request),
+        r4os.abi.display_control_op_color_exchange => replyDisplayColorDesktop(ctx, handle, header, state, request),
         else => {
             state.bad_ops +%= 1;
             setLastError(state, "bad-op");
@@ -304,6 +306,28 @@ fn replyDisplayDesktop(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os
     const response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
         r4os.abi.DisplayControlExchange{ .desktop_owner = request.desktop_owner, .status = state.display.status(display_broker.not_owner) }
         else state.display.exchange(&request);
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
+}
+
+fn replyDisplayColorClient(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState, payload: []const u8) i32
+{
+    const request = decodeFixed(r4os.abi.DisplayColorRequest, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "DISPLAYCOLORBAD");
+    const response = if (!display_broker.validColorRequest(&request)) state.display.status(display_broker.invalid)
+        else if (liveCaller(ctx, header.client_id, request.base.owner) == null) state.display.status(display_broker.not_owner)
+        else state.display.submitColor(&request);
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
+}
+fn replyDisplayColorDesktop(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState, payload: []const u8) i32
+{
+    const request = decodeFixed(r4os.abi.DisplayColorExchange, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "DISPLAYCOLORDESKBAD");
+    const caller = liveCaller(ctx, header.client_id, request.base.desktop_owner);
+    const response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
+        r4os.abi.DisplayColorExchange{ .base = .{ .desktop_owner = request.base.desktop_owner, .status = state.display.status(display_broker.not_owner) } }
+        else state.display.exchangeColor(&request);
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
 }
 
