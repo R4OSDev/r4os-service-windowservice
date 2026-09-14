@@ -1,6 +1,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const tray_broker = @import("tray_broker.zig");
+const display_broker = @import("display_broker.zig");
 
 const service_name = "WINSVC";
 const selftest_arg = "/SELFTEST";
@@ -37,6 +38,7 @@ const ServiceState = struct {
     last_error: [r4os.abi.window_service_error_bytes]u8 = .{0} ** r4os.abi.window_service_error_bytes,
     slots: [r4os.abi.window_service_max_windows]Slot = .{Slot{}} ** r4os.abi.window_service_max_windows,
     tray: tray_broker.Broker = .{},
+    display: display_broker.Broker = .{},
     next_tray_owner_sweep_tick: u64 = 0,
 };
 
@@ -142,6 +144,10 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.tray_service_op_desktop_activate,
         r4os.abi.tray_service_op_desktop_visibility,
         => replyTrayDesktop(ctx, handle, header, state, request),
+        r4os.abi.display_control_op_query,
+        r4os.abi.display_control_op_request,
+        => replyDisplayClient(ctx, handle, header, state, request),
+        r4os.abi.display_control_op_exchange => replyDisplayDesktop(ctx, handle, header, state, request),
         else => {
             state.bad_ops +%= 1;
             setLastError(state, "bad-op");
@@ -163,6 +169,7 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
         if (tray_broker.ownerValid(state.tray.desktop_owner) and processHandleGone(ctx, state.tray.desktop_owner)) {
             _ = state.tray.clearDesktop();
         }
+        if (tray_broker.ownerValid(state.display.desktop) and processHandleGone(ctx, state.display.desktop)) state.display.clear();
 
         var cursor: usize = 0;
         while (state.tray.ownerAt(cursor)) |found| {
@@ -274,6 +281,30 @@ fn decodeFixed(comptime T: type, payload: []const u8) ?T {
     var value: T = undefined;
     @memcpy(std.mem.asBytes(&value), payload);
     return value;
+}
+
+fn replyDisplayClient(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState, payload: []const u8) i32
+{
+    const request = decodeFixed(r4os.abi.DisplayControlRequest, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "DISPLAYBAD");
+    const response = if (!display_broker.validRequest(&request)) state.display.status(display_broker.invalid)
+        else if (liveCaller(ctx, header.client_id, request.owner) == null) state.display.status(display_broker.not_owner)
+        else if (header.op == r4os.abi.display_control_op_query and request.action == 0) state.display.query()
+        else if (header.op == r4os.abi.display_control_op_request) state.display.submit(&request)
+        else state.display.status(display_broker.invalid);
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
+}
+fn replyDisplayDesktop(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState, payload: []const u8) i32
+{
+    const request = decodeFixed(r4os.abi.DisplayControlExchange, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "DISPLAYDESKBAD");
+    const caller = liveCaller(ctx, header.client_id, request.desktop_owner);
+    const response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
+        r4os.abi.DisplayControlExchange{ .desktop_owner = request.desktop_owner, .status = state.display.status(display_broker.not_owner) }
+        else state.display.exchange(&request);
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
 }
 
 fn replyTextStatus(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState) i32 {
@@ -454,6 +485,7 @@ fn sweepStale(state: *ServiceState) u32 {
 }
 
 fn clearAll(state: *ServiceState, reason: []const u8) void {
+    state.display.clear();
     var i: usize = 0;
     while (i < state.slots.len) : (i += 1) state.slots[i] = .{};
     state.next_z = 1;
