@@ -573,6 +573,7 @@ fn makeRequest(owner: r4os.abi.ProgramProcessHandle, id: u64, revision: u64) r4o
 
 test "tray broker is generation-bound idempotent and bounded" {
     try @import("display_broker.zig").check();
+    try @import("graphics_broker_test.zig").check();
     const desktop = r4os.abi.ProgramProcessHandle{ .instance_id = 1, .generation = 50 };
     const owner = r4os.abi.ProgramProcessHandle{ .instance_id = 2, .generation = 70 };
     var broker: Broker = .{};

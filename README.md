@@ -4,13 +4,21 @@
 
 ## Package
 
-- Version: `0.1.3`
+- Version: `0.1.7`
 - Image target: `/R4OS/SERVICES/WINSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+The common GPU-window broker imports bounded canonical BO references and
+transports generation-bound producer/consumer leases through WINSVC. It
+does not map pixels, wait on the GPU, or implement composition/color/output
+policy. The production Desktop and Vulkan WSI integration is still pending.
+The existing `test` step covers retries, fence retirement, mailbox/FIFO,
+resize and owner cleanup. See `Docs/Desktop/GrafikFenstertransport07937.txt`
+in the workspace documentation for the transport contract.
 
 ## Build
 

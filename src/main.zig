@@ -2,6 +2,8 @@ const std = @import("std");
 const r4os = @import("r4os");
 const tray_broker = @import("tray_broker.zig");
 const display_broker = @import("display_broker.zig");
+const graphics_broker = @import("graphics_broker.zig");
+const graphics_platform = @import("graphics_platform.zig");
 
 const service_name = "WINSVC";
 const selftest_arg = "/SELFTEST";
@@ -39,6 +41,8 @@ const ServiceState = struct {
     slots: [r4os.abi.window_service_max_windows]Slot = .{Slot{}} ** r4os.abi.window_service_max_windows,
     tray: tray_broker.Broker = .{},
     display: display_broker.Broker = .{},
+    graphics: graphics_broker.Broker = .{},
+    graphics_platform: graphics_platform.Platform = .{},
     next_tray_owner_sweep_tick: u64 = 0,
 };
 
@@ -52,10 +56,10 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     var ctx = r4_app.system();
     if (hasArg(ctx.argsRaw(), selftest_arg)) return runSelfTest(&ctx);
     if (hasArg(ctx.argsRaw(), ping_arg)) return runPing(&ctx);
-    return runService(&ctx);
+    return runService(&ctx, r4_app.drawing());
 }
 
-fn runService(ctx: *const r4os.r4sys.Context) i32 {
+fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context) i32 {
     if (!ctx.hasFn("service_call")) return r4os.abi.service_api_result_invalid;
 
     var info: r4os.abi.ServiceInfo = .{};
@@ -78,6 +82,10 @@ fn runService(ctx: *const r4os.r4sys.Context) i32 {
     }
 
     var state = ServiceState{};
+    state.graphics_platform.draw = draw;
+    // Endpoint identity is not sufficient after service restart. Publish the
+    // actual process generation as part of every GPU surface handle.
+    _ = ctx.programOpenHandle(info.instance_id, &state.graphics.service);
     state.next_tray_owner_sweep_tick = ctx.ticks() +| tray_owner_sweep_ticks;
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(ctx.*, handle, .{});
@@ -150,6 +158,11 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.display_control_op_exchange => replyDisplayDesktop(ctx, handle, header, state, request),
         r4os.abi.display_control_op_color_request => replyDisplayColorClient(ctx, handle, header, state, request),
         r4os.abi.display_control_op_color_exchange => replyDisplayColorDesktop(ctx, handle, header, state, request),
+        r4os.abi.window_graphics_op_client,
+        r4os.abi.window_graphics_op_publish,
+        r4os.abi.window_graphics_op_consumer,
+        r4os.abi.window_graphics_op_wait,
+        => replyGraphics(ctx, handle, header, state, request),
         else => {
             state.bad_ops +%= 1;
             setLastError(state, "bad-op");
@@ -159,9 +172,10 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
 }
 
 fn nextServiceDeadline(state: *const ServiceState) ?u64 {
-    const owner_sweep = state.next_tray_owner_sweep_tick;
-    if (state.tray.nextDeadline()) |wait_deadline| return @min(owner_sweep, wait_deadline);
-    return owner_sweep;
+    var deadline = state.next_tray_owner_sweep_tick;
+    if (state.tray.nextDeadline()) |value| deadline = @min(deadline, value);
+    if (state.graphics.nextDeadline()) |value| deadline = @min(deadline, value);
+    return deadline;
 }
 
 fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceState) void {
@@ -172,6 +186,15 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
             _ = state.tray.clearDesktop();
         }
         if (tray_broker.ownerValid(state.display.desktop) and processHandleGone(ctx, state.display.desktop)) state.display.clear();
+        // This sweep checks process liveness only. GPU fences are inspected
+        // on producer/consumer operations, never periodically polled here.
+        for (&state.graphics.surfaces) |*surface| {
+            if (surface.identity.serial == 0) continue;
+            const desktop = surface.identity.desktop;
+            const owner = surface.identity.owner;
+            if (processHandleGone(ctx, desktop)) state.graphics.removeOwner(&state.graphics_platform, desktop);
+            if (!surface.removed and processHandleGone(ctx, owner)) state.graphics.removeOwner(&state.graphics_platform, owner);
+        }
 
         var cursor: usize = 0;
         while (state.tray.ownerAt(cursor)) |found| {
@@ -186,6 +209,57 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
         const bytes: [*]const u8 = @ptrCast(&reply.response);
         _ = r4os.app_services.replyIfPending(ctx.*, handle, reply.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayServiceResponse)]);
     }
+    replies = 0;
+    while (replies < graphics_broker.max_waiters) : (replies += 1) {
+        const reply = state.graphics.takeWaitReply(now) orelse break;
+        _ = replyGraphicsValue(ctx, handle, reply.request_id, &reply.response);
+    }
+}
+
+fn replyGraphicsValue(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, value: *const r4os.abi.WindowGraphicsReply) i32 {
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(value));
+}
+
+fn replyGraphics(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const a = r4os.abi;
+    const broker = &state.graphics;
+    const platform = &state.graphics_platform;
+    var response = broker.response(a.window_graphics_invalid);
+    switch (header.op) {
+        a.window_graphics_op_client => {
+            if (decodeFixed(a.WindowGraphicsRequest, payload)) |request| {
+                response = if (liveCaller(ctx, header.client_id, request.owner) != null)
+                    broker.client(platform, &request) else broker.response(a.window_graphics_not_owner);
+            }
+        },
+        a.window_graphics_op_publish => {
+            if (decodeFixed(a.WindowGraphicsPublication, payload)) |request| {
+                const caller = liveCaller(ctx, header.client_id, request.desktop);
+                const target = liveCaller(ctx, request.owner.instance_id, request.owner);
+                // Removal can arrive after the application has already died.
+                if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui or
+                    (request.action == a.window_graphics_publish and (target == null or target.?.app_class != program_class_gui))) {
+                    response = broker.response(a.window_graphics_not_owner);
+                } else response = broker.publish(platform, &request);
+            }
+        },
+        a.window_graphics_op_consumer => {
+            if (decodeFixed(a.WindowGraphicsConsumer, payload)) |request| {
+                const caller = liveCaller(ctx, header.client_id, request.desktop);
+                response = if (caller != null and caller.?.role == program_role_shell and caller.?.app_class == program_class_gui)
+                    broker.consumer(platform, &request) else broker.response(a.window_graphics_not_owner);
+            }
+        },
+        a.window_graphics_op_wait => {
+            if (decodeFixed(a.WindowGraphicsWait, payload)) |request| {
+                if (liveCaller(ctx, header.client_id, request.owner) == null) {
+                    response = broker.response(a.window_graphics_not_owner);
+                } else response = broker.beginWait(header.request_id, &request, ctx.ticks()) orelse return a.service_api_result_ok;
+            }
+        },
+        else => unreachable,
+    }
+    return replyGraphicsValue(ctx, handle, header.request_id, &response);
 }
 
 fn processHandleGone(ctx: *const r4os.r4sys.Context, owner: r4os.abi.ProgramProcessHandle) bool {
@@ -510,6 +584,7 @@ fn sweepStale(state: *ServiceState) u32 {
 
 fn clearAll(state: *ServiceState, reason: []const u8) void {
     state.display.clear();
+    state.graphics.clear(&state.graphics_platform);
     var i: usize = 0;
     while (i < state.slots.len) : (i += 1) state.slots[i] = .{};
     state.next_z = 1;
