@@ -1,6 +1,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const tray_broker = @import("tray_broker.zig");
+const window_mode = @import("window_mode.zig");
 const display_broker = @import("display_broker.zig");
 const graphics_broker = @import("graphics_broker.zig");
 const graphics_platform = @import("graphics_platform.zig");
@@ -45,6 +46,8 @@ const ServiceState = struct {
     graphics_platform: graphics_platform.Platform = .{},
     desktop: ?r4os.r4desk.Context = null,
     graphics_notified: u64 = 1,
+    modes: window_mode.Broker = .{},
+    modes_notified: u64 = 1,
     next_tray_owner_sweep_tick: u64 = 0,
 };
 
@@ -89,6 +92,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     // Endpoint identity is not sufficient after service restart. Publish the
     // actual process generation as part of every GPU surface handle.
     _ = ctx.programOpenHandle(info.instance_id, &state.graphics.service);
+    state.modes.service = state.graphics.service;
     state.next_tray_owner_sweep_tick = ctx.ticks() +| tray_owner_sweep_ticks;
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(ctx.*, handle, .{});
@@ -122,7 +126,8 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
 }
 
 fn notifyGraphics(state: *ServiceState) void {
-    if (state.graphics.revision == state.graphics_notified) return;
+    if (state.graphics.revision == state.graphics_notified and state.modes.revision == state.modes_notified) return;
+    state.modes_notified = state.modes.revision;
     state.graphics_notified = state.graphics.revision;
     // Coalesce each drained batch after publishing its state. Ordinary tray
     // sweeps and read-only queries do not manufacture a GPU frame clock.
@@ -170,6 +175,10 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.display_control_op_exchange => replyDisplayDesktop(ctx, handle, header, state, request),
         r4os.abi.display_control_op_color_request => replyDisplayColorClient(ctx, handle, header, state, request),
         r4os.abi.display_control_op_color_exchange => replyDisplayColorDesktop(ctx, handle, header, state, request),
+        r4os.abi.window_mode_op_query,
+        r4os.abi.window_mode_op_request,
+        r4os.abi.window_mode_op_exchange,
+        => replyWindowMode(ctx, handle, header, state, request),
         r4os.abi.window_graphics_op_client,
         r4os.abi.window_graphics_op_publish,
         r4os.abi.window_graphics_op_consumer,
@@ -208,6 +217,12 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
             if (!surface.removed and processHandleGone(ctx, owner)) state.graphics.removeOwner(&state.graphics_platform, owner);
         }
 
+        for (&state.modes.slots) |*slot| {
+            if (slot.identity.serial == 0) continue;
+            const identity = slot.identity;
+            if (processHandleGone(ctx, identity.desktop)) state.modes.removeOwner(identity.desktop);
+            if (processHandleGone(ctx, identity.owner)) state.modes.removeOwner(identity.owner);
+        }
         var cursor: usize = 0;
         while (state.tray.ownerAt(cursor)) |found| {
             cursor = found.index + 1;
@@ -369,6 +384,27 @@ fn decodeFixed(comptime T: type, payload: []const u8) ?T {
     var value: T = undefined;
     @memcpy(std.mem.asBytes(&value), payload);
     return value;
+}
+
+fn replyWindowMode(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader,
+    state: *ServiceState, payload: []const u8) i32
+{
+    var response: r4os.abi.WindowModeReply = .{ .result = window_mode.invalid };
+    if (header.op == r4os.abi.window_mode_op_exchange) {
+        if (decodeFixed(r4os.abi.WindowModeExchange, payload)) |request| {
+            const caller = liveCaller(ctx, header.client_id, request.identity.desktop);
+            response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
+                .{ .result = window_mode.not_owner }
+            else if (request.flags == 0 and liveCaller(ctx, request.identity.owner.instance_id, request.identity.owner) == null)
+                .{ .result = window_mode.unavailable }
+            else state.modes.exchange(&request);
+        }
+    } else if (decodeFixed(r4os.abi.WindowModeRequest, payload)) |request| {
+        response = if (liveCaller(ctx, header.client_id, request.identity.owner) == null) .{ .result = window_mode.not_owner }
+            else if (header.op == r4os.abi.window_mode_op_query) state.modes.query(&request)
+            else state.modes.submit(&request);
+    }
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
 }
 
 fn replyDisplayClient(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader,
@@ -596,6 +632,7 @@ fn sweepStale(state: *ServiceState) u32 {
 
 fn clearAll(state: *ServiceState, reason: []const u8) void {
     state.display.clear();
+    state.modes.clear();
     state.graphics.clear(&state.graphics_platform);
     var i: usize = 0;
     while (i < state.slots.len) : (i += 1) state.slots[i] = .{};

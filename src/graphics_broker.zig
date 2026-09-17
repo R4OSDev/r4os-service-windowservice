@@ -289,10 +289,28 @@ pub const Broker = struct {
     }
 
     pub fn consumer(self: *Broker, platform: anytype, request: *const a.WindowGraphicsConsumer) a.WindowGraphicsReply {
-        if (!validHeader(request.*) or request.reserved != 0 or request.action > a.window_graphics_release_fence or request.request_serial == 0)
+        if (!validHeader(request.*) or request.reserved != 0 or request.action > a.window_graphics_inspect)
             return self.response(a.window_graphics_invalid);
         const surface = self.findSurface(request.surface) orelse return self.response(a.window_graphics_stale);
         if (!owners.sameOwner(surface.identity.desktop, request.desktop)) return self.response(a.window_graphics_not_owner);
+        if (request.action == a.window_graphics_inspect) {
+            if (request.request_serial != 0 or request.chain == 0 or request.acquire_token == 0 or
+                request.result != 0 or !zeroFence(request.fence)) return self.snapshot(surface, a.window_graphics_invalid);
+            var result = self.snapshot(surface, a.window_graphics_closed);
+            result.chain = request.chain;
+            result.image_slot = request.image_slot;
+            result.acquire_token = request.acquire_token;
+            const chain = self.findChain(surface.identity, request.chain) orelse return result;
+            if (request.image_slot >= chain.count) return self.snapshot(surface, a.window_graphics_invalid);
+            const item = &chain.images[request.image_slot];
+            if (item.phase != .leased or item.token != request.acquire_token) return self.snapshot(surface, a.window_graphics_stale);
+            result.result = chain.error_result;
+            result.flags = a.window_graphics_image_leased;
+            // Read-only: neither end a metadata loan nor displace the receipt
+            // needed to retry the last mutation after a lost response.
+            return result;
+        }
+        if (request.request_serial == 0) return self.snapshot(surface, a.window_graphics_invalid);
         if (request.request_serial <= surface.last_consumer.request_serial) {
             if (std.meta.eql(surface.last_consumer, request.*)) return surface.consumer_reply;
             return self.snapshot(surface, a.window_graphics_stale);
@@ -539,10 +557,14 @@ fn validConfig(value: a.WindowGraphicsConfig) bool {
         value.present_modes == 0 or value.present_modes & ~@as(u32, a.window_graphics_fifo | a.window_graphics_mailbox) != 0 or
         value.format_count == 0 or value.format_count > value.formats.len or !validHeader(value.backend) or !validHeader(binding) or
         value.display_generation == 0 or value.output.connector_id == 0 or value.output.connection_generation == 0 or
-        value.output.adapter_id != binding.adapter_id or value.output.device_generation != binding.device_generation) return false;
+        value.output.device_generation == 0) return false;
     if (binding.device_generation == 0 or binding.reset_generation == 0) return false;
     if (binding.adapter_id == 0 and binding.milestone != a.gfx_queue_milestone_cpu_stores) return false;
     if (binding.adapter_id != 0 and (value.backend.memory_generation == 0 or binding.milestone != a.gfx_queue_milestone_device_execution)) return false;
+    // CPU rendering is independent of the physical output adapter. Only a
+    // device-local producer must share the output's exact device incarnation.
+    if (binding.adapter_id != 0 and (value.output.adapter_id != binding.adapter_id or
+        value.output.device_generation != binding.device_generation)) return false;
     for (value.formats[0..value.format_count], 0..) |format, index| {
         if (format.format == 0 or format.reserved != 0) return false;
         for (value.formats[0..index]) |prior| if (std.meta.eql(prior, format)) return false;

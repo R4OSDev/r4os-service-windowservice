@@ -36,7 +36,7 @@ const Platform = struct {
         if (value.slot == 0 or value.slot > self.terminal.len) return false;
         const index = value.slot - 1;
         if (self.released[index]) return false;
-        output.* = .{ .fence = value, .phase = if (self.terminal[index]) a.gfx_queue_phase_terminal else a.gfx_queue_phase_running, .milestone = if (value.adapter_id == 2) a.gfx_queue_milestone_scanout else a.gfx_queue_milestone_device_execution, .flags = if (self.held[index]) a.gfx_queue_flag_resources_held else 0, .result = if (self.failed[index]) a.gfx_queue_result_failed else if (self.terminal[index]) a.gfx_queue_result_complete else a.gfx_queue_result_pending };
+        output.* = .{ .fence = value, .phase = if (self.terminal[index]) a.gfx_queue_phase_terminal else a.gfx_queue_phase_running, .milestone = if (value.adapter_id == 0) a.gfx_queue_milestone_cpu_stores else if (value.adapter_id == 2) a.gfx_queue_milestone_scanout else a.gfx_queue_milestone_device_execution, .flags = if (self.held[index]) a.gfx_queue_flag_resources_held else 0, .result = if (self.failed[index]) a.gfx_queue_result_failed else if (self.terminal[index]) a.gfx_queue_result_complete else a.gfx_queue_result_pending };
         return true;
     }
 };
@@ -98,6 +98,63 @@ pub fn check() !void {
     try consumerCompletionBeforeProducer();
     try mailboxAndLifecycle();
     try rejectionAndWait();
+    try cpuProducerOnPhysicalOutput();
+}
+fn cpuProducerOnPhysicalOutput() !void {
+    var f: Fixture = .{};
+    f.publication.config.output.adapter_id = 9;
+    try t.expectEqual(a.window_graphics_invalid, f.broker.publish(&f.platform, &f.publication).result);
+    f.publication.config.backend = .{ .binding = .{ .adapter_id = 0,
+        .device_generation = 1, .reset_generation = 1, .milestone = a.gfx_queue_milestone_cpu_stores } };
+    f.platform.descriptor.location = a.gfx_buffer_location_system;
+    f.platform.descriptor.adapter_id = 0; f.platform.descriptor.device_generation = 0;
+    try f.init(a.window_graphics_fifo);
+    defer f.broker.clear(&f.platform);
+    const acquired = try f.acquire();
+    const ready: a.GfxFence = .{ .slot = 1, .timeline = 1, .point = 1, .device_generation = 1, .reset_generation = 1 };
+    try f.present(acquired, ready);
+    const take = f.consumer(a.window_graphics_take);
+    const taken = f.broker.consumer(&f.platform, &take);
+    try t.expectEqual(a.window_graphics_ok, taken.result);
+    try t.expectEqual(a.gfx_buffer_location_system, taken.frame.descriptor.location);
+    try t.expectEqual(ready, taken.frame.ready);
+    f.platform.terminal[0] = true;
+    var returning = f.consumer(a.window_graphics_return);
+    returning.image_slot = acquired.image_slot; returning.acquire_token = acquired.acquire_token;
+    const returned = f.broker.consumer(&f.platform, &returning);
+    try t.expectEqual(a.window_graphics_ok, returned.result);
+    try t.expect(returned.flags & a.window_graphics_fence_released != 0);
+    const next = try f.acquire();
+    try t.expect(next.image_slot == acquired.image_slot and next.acquire_token != acquired.acquire_token);
+    try f.present(next, ready);
+    const take_last = f.consumer(a.window_graphics_take);
+    const last = f.broker.consumer(&f.platform, &take_last);
+    var inspect: a.WindowGraphicsConsumer = .{ .desktop = f.publication.desktop,
+        .surface = last.surface, .action = a.window_graphics_inspect,
+        .chain = last.chain, .image_slot = last.image_slot, .acquire_token = last.acquire_token };
+    const before_inspect = f.broker.revision;
+    try t.expectEqual(a.window_graphics_ok, f.broker.consumer(&f.platform, &inspect).result);
+    try t.expectEqual(before_inspect, f.broker.revision);
+    try t.expectEqual(last, f.broker.consumer(&f.platform, &take_last));
+    inspect.acquire_token -= 1;
+    try t.expectEqual(a.window_graphics_stale, f.broker.consumer(&f.platform, &inspect).result);
+    inspect.acquire_token = last.acquire_token;
+    inspect.desktop.generation += 1;
+    try t.expectEqual(a.window_graphics_not_owner, f.broker.consumer(&f.platform, &inspect).result);
+    inspect.desktop = f.publication.desktop;
+    const close = f.makeRequest(a.window_graphics_close_chain);
+    try t.expectEqual(a.window_graphics_ok, f.broker.client(&f.platform, &close).result);
+    const closed_revision = f.broker.revision;
+    const closed = f.broker.consumer(&f.platform, &inspect);
+    try t.expectEqual(a.window_graphics_closed, closed.result);
+    try t.expectEqual(a.window_graphics_image_leased, closed.flags);
+    try t.expectEqual(last.acquire_token, closed.acquire_token);
+    try t.expectEqual(closed_revision, f.broker.revision);
+    try t.expectEqual(@as(usize, 1), f.platform.references);
+    returning = f.consumer(a.window_graphics_return);
+    returning.image_slot = last.image_slot; returning.acquire_token = last.acquire_token;
+    try t.expectEqual(a.window_graphics_fence_released, f.broker.consumer(&f.platform, &returning).flags);
+    try t.expectEqual(@as(usize, 0), f.platform.references);
 }
 
 fn consumerCompletionBeforeProducer() !void {
