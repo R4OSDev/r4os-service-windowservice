@@ -15,6 +15,7 @@ const Platform = struct {
     terminal: [8]bool = .{false} ** 8,
     held: [8]bool = .{false} ** 8,
     failed: [8]bool = .{false} ** 8,
+    released: [8]bool = .{false} ** 8,
     pub fn importBuffer(self: *Platform, source: a.GfxBufferHandle, output: *a.GfxBufferReference) bool {
         if (self.reject) return false;
         self.imports += 1;
@@ -34,6 +35,7 @@ const Platform = struct {
     pub fn queryFence(self: *Platform, value: a.GfxFence, output: *a.GfxFenceStatus) bool {
         if (value.slot == 0 or value.slot > self.terminal.len) return false;
         const index = value.slot - 1;
+        if (self.released[index]) return false;
         output.* = .{ .fence = value, .phase = if (self.terminal[index]) a.gfx_queue_phase_terminal else a.gfx_queue_phase_running, .milestone = if (value.adapter_id == 2) a.gfx_queue_milestone_scanout else a.gfx_queue_milestone_device_execution, .flags = if (self.held[index]) a.gfx_queue_flag_resources_held else 0, .result = if (self.failed[index]) a.gfx_queue_result_failed else if (self.terminal[index]) a.gfx_queue_result_complete else a.gfx_queue_result_pending };
         return true;
     }
@@ -93,8 +95,61 @@ const Fixture = struct {
 
 pub fn check() !void {
     try leaseAndFenceRetirement();
+    try consumerCompletionBeforeProducer();
     try mailboxAndLifecycle();
     try rejectionAndWait();
+}
+
+fn consumerCompletionBeforeProducer() !void {
+    var f: Fixture = .{};
+    try f.init(a.window_graphics_fifo);
+    defer f.broker.clear(&f.platform);
+    const first = try f.acquire();
+    try f.present(first, fence(1));
+    const take = f.consumer(a.window_graphics_take);
+    _ = f.broker.consumer(&f.platform, &take);
+    _ = try f.acquire();
+    var request = f.consumer(a.window_graphics_return);
+    request.image_slot = first.image_slot;
+    request.acquire_token = first.acquire_token;
+    request.fence = fence(3);
+    try t.expectEqual(@as(u32, 0), f.broker.consumer(&f.platform, &request).flags);
+    request.action = a.window_graphics_release_fence;
+    request.request_serial = f.consumer(a.window_graphics_release_fence).request_serial;
+    try t.expectEqual(a.window_graphics_not_ready, f.broker.consumer(&f.platform, &request).result);
+    f.platform.terminal[2] = true;
+    const receipt = f.broker.consumer(&f.platform, &request);
+    try t.expectEqual(a.window_graphics_ok, receipt.result);
+    try t.expectEqual(a.window_graphics_fence_released, receipt.flags);
+    f.platform.released[2] = true;
+    const acquire = f.makeRequest(a.window_graphics_acquire);
+    try t.expectEqual(a.window_graphics_not_ready, f.broker.client(&f.platform, &acquire).result);
+    f.platform.terminal[0] = true;
+    try t.expectEqual(a.window_graphics_ok, f.broker.client(&f.platform, &acquire).result);
+
+    f.broker.clear(&f.platform);
+    f = .{};
+    try f.init(a.window_graphics_fifo);
+    const failing = try f.acquire();
+    try f.present(failing, fence(1));
+    const failing_take = f.consumer(a.window_graphics_take);
+    _ = f.broker.consumer(&f.platform, &failing_take);
+    request = f.consumer(a.window_graphics_return);
+    request.image_slot = failing.image_slot;
+    request.acquire_token = failing.acquire_token;
+    request.fence = fence(3);
+    try t.expectEqual(a.window_graphics_ok, f.broker.consumer(&f.platform, &request).result);
+    const revision = f.broker.revision;
+    const wait: a.WindowGraphicsWait = .{ .owner = f.publication.owner, .known_revision = revision, .deadline_tick = 100 };
+    try t.expect(f.broker.beginWait(1, &wait, 1) == null);
+    f.platform.terminal[2] = true;
+    f.platform.failed[2] = true;
+    request.action = a.window_graphics_release_fence;
+    request.request_serial = f.consumer(a.window_graphics_release_fence).request_serial;
+    try t.expectEqual(a.window_graphics_device_lost, f.broker.consumer(&f.platform, &request).result);
+    try t.expect(f.broker.revision > revision);
+    try t.expectEqual(a.window_graphics_ok, f.broker.takeWaitReply(2).?.response.result);
+    try t.expectEqual(@as(usize, 0), f.platform.references);
 }
 
 fn leaseAndFenceRetirement() !void {
@@ -116,7 +171,13 @@ fn leaseAndFenceRetirement() !void {
     returning.fence = fence(3);
     returning.fence.adapter_id = 2;
     returning.fence.reset_generation = 99;
-    try t.expectEqual(a.window_graphics_ok, f.broker.consumer(&f.platform, &returning).result);
+    const returned = f.broker.consumer(&f.platform, &returning);
+    try t.expectEqual(a.window_graphics_ok, returned.result);
+    try t.expectEqual(@as(u32, 0), returned.flags);
+    var receipt = returning;
+    receipt.action = a.window_graphics_release_fence;
+    receipt.request_serial = f.consumer(a.window_graphics_release_fence).request_serial;
+    try t.expectEqual(a.window_graphics_not_ready, f.broker.consumer(&f.platform, &receipt).result);
     var acquire = f.makeRequest(a.window_graphics_acquire);
     var result = f.broker.client(&f.platform, &acquire);
     try t.expectEqual(a.window_graphics_not_ready, result.result);
@@ -128,12 +189,20 @@ fn leaseAndFenceRetirement() !void {
     f.platform.terminal[2] = true;
     f.platform.held[2] = true;
     try t.expectEqual(a.window_graphics_not_ready, f.broker.client(&f.platform, &acquire).result);
+    try t.expectEqual(a.window_graphics_not_ready, f.broker.consumer(&f.platform, &receipt).result);
     f.platform.held[2] = false;
     result = f.broker.client(&f.platform, &acquire);
     try t.expectEqual(a.window_graphics_ok, result.result);
     try t.expectEqual(first.image_slot, result.image_slot);
     try t.expect(result.acquire_token > first.acquire_token);
     try t.expect(std.meta.eql(result, f.broker.client(&f.platform, &acquire)));
+    // Producer-side retirement can acknowledge a delayed consumer after slot
+    // reuse. Once acknowledged, deleting the job's metadata is safe.
+    const acknowledged = f.broker.consumer(&f.platform, &receipt);
+    try t.expectEqual(a.window_graphics_ok, acknowledged.result);
+    try t.expectEqual(a.window_graphics_fence_released, acknowledged.flags);
+    f.platform.released[2] = true;
+    try t.expect(std.meta.eql(acknowledged, f.broker.consumer(&f.platform, &receipt)));
     var old = f.makeRequest(a.window_graphics_present);
     old.image_slot = first.image_slot;
     old.acquire_token = first.acquire_token;
@@ -143,6 +212,28 @@ fn leaseAndFenceRetirement() !void {
     try t.expectEqual(second.image_slot, f.broker.consumer(&f.platform, &take).image_slot);
     f.broker.clear(&f.platform);
     try t.expectEqual(@as(usize, 0), f.platform.references);
+
+    // A completed Return snapshots its receipt even if the producer is still
+    // pending. The next Acquire must never query freed consumer metadata.
+    f = .{};
+    try f.init(a.window_graphics_fifo);
+    const pending = try f.acquire();
+    try f.present(pending, fence(1));
+    take = f.consumer(a.window_graphics_take);
+    _ = f.broker.consumer(&f.platform, &take);
+    _ = try f.acquire(); // No other available slot can conceal the result.
+    returning = f.consumer(a.window_graphics_return);
+    returning.image_slot = pending.image_slot;
+    returning.acquire_token = pending.acquire_token;
+    returning.fence = fence(3);
+    f.platform.terminal[2] = true;
+    result = f.broker.consumer(&f.platform, &returning);
+    try t.expectEqual(a.window_graphics_fence_released, result.flags);
+    f.platform.released[2] = true;
+    acquire = f.makeRequest(a.window_graphics_acquire);
+    try t.expectEqual(a.window_graphics_not_ready, f.broker.client(&f.platform, &acquire).result);
+    f.platform.terminal[0] = true;
+    try t.expectEqual(a.window_graphics_ok, f.broker.client(&f.platform, &acquire).result);
 }
 
 fn mailboxAndLifecycle() !void {
@@ -169,14 +260,29 @@ fn mailboxAndLifecycle() !void {
     acquire = f.makeRequest(a.window_graphics_acquire);
     try t.expectEqual(a.window_graphics_out_of_date, f.broker.client(&f.platform, &acquire).result);
     try t.expectEqual(@as(usize, 1), f.platform.references); // Resize retained exact Desktop lease.
+    var resize_return = f.consumer(a.window_graphics_return);
+    resize_return.image_slot = frame.image_slot;
+    resize_return.acquire_token = frame.acquire_token;
+    const resized = f.broker.consumer(&f.platform, &resize_return);
+    try t.expectEqual(a.window_graphics_ok, resized.result);
+    try t.expectEqual(a.window_graphics_fence_released, resized.flags);
+    try t.expectEqual(@as(usize, 0), f.platform.references); // Return after resize drops its last import.
+    // A fresh lease is retained independently through app death below.
+    f.broker.clear(&f.platform);
+    f = .{};
+    try f.init(a.window_graphics_fifo);
+    const dying = try f.acquire();
+    try f.present(dying, fence(1));
+    take = f.consumer(a.window_graphics_take);
+    const dead_frame = f.broker.consumer(&f.platform, &take);
     f.broker.removeOwner(&f.platform, f.publication.owner);
     try t.expectEqual(@as(usize, 1), f.platform.references);
     const revision = f.broker.revision;
     f.broker.removeOwner(&f.platform, f.publication.owner);
     try t.expectEqual(revision, f.broker.revision); // No recurring fake change on dead-owner sweep.
     var returning = f.consumer(a.window_graphics_return);
-    returning.image_slot = frame.image_slot;
-    returning.acquire_token = frame.acquire_token;
+    returning.image_slot = dead_frame.image_slot;
+    returning.acquire_token = dead_frame.acquire_token;
     try t.expectEqual(a.window_graphics_ok, f.broker.consumer(&f.platform, &returning).result);
     try t.expectEqual(@as(usize, 0), f.platform.references);
     const old_surface = f.publication.surface;

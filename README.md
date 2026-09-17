@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.7`
+- Version: `0.1.8`
 - Image target: `/R4OS/SERVICES/WINSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -16,6 +16,9 @@ The common GPU-window broker imports bounded canonical BO references and
 transports generation-bound producer/consumer leases through WINSVC. It
 does not map pixels, wait on the GPU, or implement composition/color/output
 policy. The production Desktop and Vulkan WSI integration is still pending.
+Consumers receive an explicit acknowledgement before releasing borrowed
+fence metadata. Changed graphics revisions wake the existing Desktop activity
+wait through the optional R4DESK tail; unchanged queries remain silent.
 The existing `test` step covers retries, fence retirement, mailbox/FIFO,
 resize and owner cleanup. See `Docs/Desktop/GrafikFenstertransport07937.txt`
 in the workspace documentation for the transport contract.

@@ -17,6 +17,9 @@ const Image = struct {
     order: u64 = 0,
     ready: a.GfxFence = .{},
     consumed: a.GfxFence = .{},
+    // Monotone acquisition tokens allow a delayed acknowledgement after the
+    // producer has already reused this slot. This receipt owns no GPU work.
+    consumer_released_token: u64 = 0,
 };
 const Chain = struct {
     id: u64 = 0,
@@ -286,7 +289,7 @@ pub const Broker = struct {
     }
 
     pub fn consumer(self: *Broker, platform: anytype, request: *const a.WindowGraphicsConsumer) a.WindowGraphicsReply {
-        if (!validHeader(request.*) or request.reserved != 0 or request.action > a.window_graphics_return or request.request_serial == 0)
+        if (!validHeader(request.*) or request.reserved != 0 or request.action > a.window_graphics_release_fence or request.request_serial == 0)
             return self.response(a.window_graphics_invalid);
         const surface = self.findSurface(request.surface) orelse return self.response(a.window_graphics_stale);
         if (!owners.sameOwner(surface.identity.desktop, request.desktop)) return self.response(a.window_graphics_not_owner);
@@ -296,7 +299,21 @@ pub const Broker = struct {
         }
         if (self.revision == std.math.maxInt(u64)) return self.snapshot(surface, a.window_graphics_capacity);
         var result = self.snapshot(surface, a.window_graphics_ok);
-        if (request.action == a.window_graphics_take) {
+        if (request.action == a.window_graphics_release_fence) {
+            const chain = self.findChain(surface.identity, request.chain) orelse return self.snapshot(surface, a.window_graphics_closed);
+            if (request.image_slot >= chain.count or request.acquire_token == 0) return self.snapshot(surface, a.window_graphics_invalid);
+            const item = &chain.images[request.image_slot];
+            if (request.acquire_token > item.consumer_released_token) {
+                if (item.phase != .returning or item.token != request.acquire_token or !std.meta.eql(item.consumed, request.fence))
+                    return self.snapshot(surface, a.window_graphics_stale);
+                const retired = self.retireConsumer(platform, chain, item);
+                if (retired != a.window_graphics_ok) return self.snapshot(surface, retired);
+            }
+            result.flags = a.window_graphics_fence_released;
+            result.chain = request.chain;
+            result.image_slot = request.image_slot;
+            result.acquire_token = request.acquire_token;
+        } else if (request.action == a.window_graphics_take) {
             if (surface.removed) return self.snapshot(surface, a.window_graphics_closed);
             if (surface.config.flags & a.window_graphics_visible == 0) return self.snapshot(surface, a.window_graphics_not_ready);
             var selected: ?*Chain = null;
@@ -338,8 +355,20 @@ pub const Broker = struct {
                 return self.snapshot(surface, a.window_graphics_device_lost);
             item.consumed = request.fence;
             item.phase = .returning;
-            if (request.result != a.window_graphics_ok) self.invalidate(platform, chain, request.result);
-            if (chain.closing) self.closeChain(platform, chain, false);
+            if (request.result != a.window_graphics_ok or chain.error_result != a.window_graphics_ok) {
+                // Invalidated chains cannot recycle. Drop this returned lease
+                // as well; the old invalidate call intentionally retained it.
+                self.invalidate(platform, chain, if (request.result != a.window_graphics_ok) request.result else chain.error_result);
+                result.flags = a.window_graphics_fence_released;
+            } else if (self.retireConsumer(platform, chain, item) != a.window_graphics_not_ready) {
+                // Complete (or invalidated) metadata is no longer borrowed.
+                // This does not assert physical success for a failed chain.
+                result.flags = a.window_graphics_fence_released;
+            }
+            if (chain.closing) {
+                self.closeChain(platform, chain, false);
+                result.flags = a.window_graphics_fence_released;
+            }
             result.chain = request.chain;
             result.image_slot = request.image_slot;
             result.acquire_token = request.acquire_token;
@@ -352,8 +381,13 @@ pub const Broker = struct {
     }
 
     fn retireCheck(self: *Broker, platform: anytype, chain: *Chain, item: *Image, wait: *a.GfxFence) i32 {
-        var pending = false;
-        for ([_]a.GfxFence{ item.ready, item.consumed }) |fence| {
+        // Retire the consumer independently of the producer. A compositor
+        // must be able to release its job even while producer work is pending.
+        const consumer_result = self.retireConsumer(platform, chain, item);
+        if (consumer_result < 0) return consumer_result;
+        var pending = consumer_result == a.window_graphics_not_ready;
+        if (pending) wait.* = item.consumed;
+        for ([_]a.GfxFence{item.ready}) |fence| {
             if (zeroFence(fence)) continue;
             var status: a.GfxFenceStatus = .{};
             if (!platform.queryFence(fence, &status) or !validHeader(status) or !std.meta.eql(status.fence, fence) or
@@ -363,7 +397,7 @@ pub const Broker = struct {
                 return a.window_graphics_device_lost;
             }
             if (status.phase != a.gfx_queue_phase_terminal or status.flags & (a.gfx_queue_flag_device_active | a.gfx_queue_flag_resources_held) != 0) {
-                if (!pending) wait.* = fence;
+                wait.* = fence;
                 pending = true;
             }
         }
@@ -371,8 +405,26 @@ pub const Broker = struct {
         item.phase = .available;
         return a.window_graphics_ok;
     }
+    fn retireConsumer(self: *Broker, platform: anytype, chain: *Chain, item: *Image) i32 {
+        if (!zeroFence(item.consumed)) {
+            var status: a.GfxFenceStatus = .{};
+            if (!platform.queryFence(item.consumed, &status) or !validHeader(status) or !std.meta.eql(status.fence, item.consumed) or
+                (status.phase == a.gfx_queue_phase_terminal and status.result != a.gfx_queue_result_complete))
+            {
+                self.invalidate(platform, chain, a.window_graphics_device_lost);
+                return a.window_graphics_device_lost;
+            }
+            if (status.phase != a.gfx_queue_phase_terminal or status.flags & (a.gfx_queue_flag_device_active | a.gfx_queue_flag_resources_held) != 0)
+                return a.window_graphics_not_ready;
+        }
+        item.consumed = .{};
+        item.consumer_released_token = item.token;
+        return a.window_graphics_ok;
+    }
     fn invalidate(self: *Broker, platform: anytype, chain: *Chain, result: i32) void {
-        _ = self;
+        // Failures can be discovered by Acquire or release_fence, whose error
+        // replies do not pass through the successful-mutation revision bump.
+        self.changed();
         chain.error_result = result;
         // Already-leased images survive resize/hotplug until explicit return.
         // Other imports can close: resident GPU jobs hold their own pins.

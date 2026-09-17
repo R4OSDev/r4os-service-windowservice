@@ -43,6 +43,8 @@ const ServiceState = struct {
     display: display_broker.Broker = .{},
     graphics: graphics_broker.Broker = .{},
     graphics_platform: graphics_platform.Platform = .{},
+    desktop: ?r4os.r4desk.Context = null,
+    graphics_notified: u64 = 1,
     next_tray_owner_sweep_tick: u64 = 0,
 };
 
@@ -56,10 +58,10 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     var ctx = r4_app.system();
     if (hasArg(ctx.argsRaw(), selftest_arg)) return runSelfTest(&ctx);
     if (hasArg(ctx.argsRaw(), ping_arg)) return runPing(&ctx);
-    return runService(&ctx, r4_app.drawing());
+    return runService(&ctx, r4_app.drawing(), r4_app.desktop());
 }
 
-fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context) i32 {
+fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, desktop: ?r4os.r4desk.Context) i32 {
     if (!ctx.hasFn("service_call")) return r4os.abi.service_api_result_invalid;
 
     var info: r4os.abi.ServiceInfo = .{};
@@ -83,6 +85,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context) i32 {
 
     var state = ServiceState{};
     state.graphics_platform.draw = draw;
+    state.desktop = desktop;
     // Endpoint identity is not sufficient after service restart. Publish the
     // actual process generation as part of every GPU surface handle.
     _ = ctx.programOpenHandle(info.instance_id, &state.graphics.service);
@@ -108,6 +111,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context) i32 {
             },
         }
         maintainTray(ctx, handle, &state);
+        notifyGraphics(&state);
     }
 
     service_loop.report(service_name);
@@ -115,6 +119,14 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context) i32 {
     _ = ctx.serviceEndpointUnregister(handle);
     ctx.println("WINSVC stopped cleanly");
     return 0;
+}
+
+fn notifyGraphics(state: *ServiceState) void {
+    if (state.graphics.revision == state.graphics_notified) return;
+    state.graphics_notified = state.graphics.revision;
+    // Coalesce each drained batch after publishing its state. Ordinary tray
+    // sweeps and read-only queries do not manufacture a GPU frame clock.
+    if (state.desktop) |desktop| _ = desktop.desktopActivityNotify();
 }
 
 fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceState) i32 {
@@ -589,6 +601,7 @@ fn clearAll(state: *ServiceState, reason: []const u8) void {
     while (i < state.slots.len) : (i += 1) state.slots[i] = .{};
     state.next_z = 1;
     noteChange(state, reason);
+    notifyGraphics(state);
 }
 
 fn selectFallbackFocus(state: *ServiceState) void {
