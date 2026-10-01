@@ -496,6 +496,13 @@ pub const Broker = struct {
     }
 };
 
+/// A restarted GUI desktop retains its declared owner role even when it was
+/// not the boot shell. Ordinary GUI applications do not acquire this role.
+pub fn desktopEligible(info: r4os.abi.ProgramInstanceInfo) bool {
+    return info.app_class == 1 and (info.role == 1 or
+        info.flags & r4os.abi.program_instance_flag_desktop_host != 0);
+}
+
 pub fn validBaseRequest(request: *const r4os.abi.TrayServiceRequest) bool {
     return request.magic == r4os.abi.tray_service_request_magic and
         request.version == r4os.abi.tray_service_request_version and
@@ -572,6 +579,10 @@ fn makeRequest(owner: r4os.abi.ProgramProcessHandle, id: u64, revision: u64) r4o
 }
 
 test "tray broker is generation-bound idempotent and bounded" {
+    try std.testing.expect(desktopEligible(.{ .app_class = 1, .role = 1 }));
+    try std.testing.expect(desktopEligible(.{ .app_class = 1, .role = 2, .flags = r4os.abi.program_instance_flag_desktop_host }));
+    try std.testing.expect(!desktopEligible(.{ .app_class = 1, .role = 2 }));
+    try std.testing.expect(!desktopEligible(.{ .app_class = 0, .role = 1, .flags = r4os.abi.program_instance_flag_desktop_host }));
     try @import("display_broker.zig").check();
     try @import("window_mode.zig").check();
     try @import("graphics_broker_test.zig").check();

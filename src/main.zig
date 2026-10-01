@@ -11,7 +11,6 @@ const selftest_arg = "/SELFTEST";
 const ping_arg = "/PING";
 const service_timeout_ticks: u64 = 120;
 const tray_owner_sweep_ticks: u64 = 50;
-const program_role_shell: u8 = 1;
 const program_class_gui: u8 = 1;
 const program_state_done: u8 = 2;
 
@@ -261,10 +260,10 @@ fn replyGraphics(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.S
         },
         a.window_graphics_op_publish => {
             if (decodeFixed(a.WindowGraphicsPublication, payload)) |request| {
-                const caller = liveCaller(ctx, header.client_id, request.desktop);
+                const caller = desktopCaller(ctx, header.client_id, request.desktop, state);
                 const target = liveCaller(ctx, request.owner.instance_id, request.owner);
                 // Removal can arrive after the application has already died.
-                if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui or
+                if (caller == null or
                     (request.action == a.window_graphics_publish and (target == null or target.?.app_class != program_class_gui))) {
                     response = broker.response(a.window_graphics_not_owner);
                 } else response = broker.publish(platform, &request);
@@ -272,8 +271,8 @@ fn replyGraphics(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.S
         },
         a.window_graphics_op_consumer => {
             if (decodeFixed(a.WindowGraphicsConsumer, payload)) |request| {
-                const caller = liveCaller(ctx, header.client_id, request.desktop);
-                response = if (caller != null and caller.?.role == program_role_shell and caller.?.app_class == program_class_gui)
+                const caller = desktopCaller(ctx, header.client_id, request.desktop, state);
+                response = if (caller != null)
                     broker.consumer(platform, &request) else broker.response(a.window_graphics_not_owner);
             }
         },
@@ -292,8 +291,8 @@ fn replyGraphics(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.S
 fn processHandleGone(ctx: *const r4os.r4sys.Context, owner: r4os.abi.ProgramProcessHandle) bool {
     var info: r4os.abi.ProgramInstanceInfo = .{};
     const rc = ctx.programHandleStatus(&owner, &info);
-    if (rc == r4os.abi.program_handle_error_would_block) return false;
-    return rc != r4os.abi.program_handle_ok or info.id != owner.instance_id or info.state == program_state_done;
+    return rc == r4os.abi.program_handle_error_not_found or rc == r4os.abi.program_handle_error_stale or
+        (rc == r4os.abi.program_handle_ok and info.id == owner.instance_id and info.state == program_state_done);
 }
 
 fn liveCaller(ctx: *const r4os.r4sys.Context, client_id: u32, owner: r4os.abi.ProgramProcessHandle) ?r4os.abi.ProgramInstanceInfo {
@@ -303,6 +302,17 @@ fn liveCaller(ctx: *const r4os.r4sys.Context, client_id: u32, owner: r4os.abi.Pr
         info.id != owner.instance_id or info.state == program_state_done)
     {
         return null;
+    }
+    return info;
+}
+
+fn desktopCaller(ctx: *const r4os.r4sys.Context, client_id: u32, owner: r4os.abi.ProgramProcessHandle, state: *const ServiceState) ?r4os.abi.ProgramInstanceInfo {
+    const info = liveCaller(ctx, client_id, owner) orelse return null;
+    if (!tray_broker.desktopEligible(info)) return null;
+    // Bindings survive pending close and ambiguous status. Only confirmed
+    // retirement allows a different exact process generation to take over.
+    for ([_]r4os.abi.ProgramProcessHandle{ state.tray.desktop_owner, state.display.desktop }) |bound| {
+        if (tray_broker.ownerValid(bound) and !tray_broker.sameOwner(bound, owner) and !processHandleGone(ctx, bound)) return null;
     }
     return info;
 }
@@ -350,8 +360,8 @@ fn replyTrayDesktop(
     const request = decodeFixed(r4os.abi.TrayDesktopExchange, payload) orelse
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "TRAYDESKBAD");
     var response: r4os.abi.TrayDesktopExchange = undefined;
-    const caller = liveCaller(ctx, header.client_id, request.desktop_owner);
-    if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui) {
+    const caller = desktopCaller(ctx, header.client_id, request.desktop_owner, state);
+    if (caller == null) {
         response = trayDesktopFailure(state, request.desktop_owner, r4os.abi.tray_result_not_owner);
     } else response = switch (header.op) {
         r4os.abi.tray_service_op_desktop_sync => state.tray.desktopSync(&request),
@@ -392,8 +402,8 @@ fn replyWindowMode(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi
     var response: r4os.abi.WindowModeReply = .{ .result = window_mode.invalid };
     if (header.op == r4os.abi.window_mode_op_exchange) {
         if (decodeFixed(r4os.abi.WindowModeExchange, payload)) |request| {
-            const caller = liveCaller(ctx, header.client_id, request.identity.desktop);
-            response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
+            const caller = desktopCaller(ctx, header.client_id, request.identity.desktop, state);
+            response = if (caller == null)
                 .{ .result = window_mode.not_owner }
             else if (request.flags == 0 and liveCaller(ctx, request.identity.owner.instance_id, request.identity.owner) == null)
                 .{ .result = window_mode.unavailable }
@@ -424,8 +434,8 @@ fn replyDisplayDesktop(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os
 {
     const request = decodeFixed(r4os.abi.DisplayControlExchange, payload) orelse
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "DISPLAYDESKBAD");
-    const caller = liveCaller(ctx, header.client_id, request.desktop_owner);
-    const response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
+    const caller = desktopCaller(ctx, header.client_id, request.desktop_owner, state);
+    const response = if (caller == null)
         r4os.abi.DisplayControlExchange{ .desktop_owner = request.desktop_owner, .status = state.display.status(display_broker.not_owner) }
         else state.display.exchange(&request);
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
@@ -446,8 +456,8 @@ fn replyDisplayColorDesktop(ctx: *const r4os.r4sys.Context, handle: u32, header:
 {
     const request = decodeFixed(r4os.abi.DisplayColorExchange, payload) orelse
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "DISPLAYCOLORDESKBAD");
-    const caller = liveCaller(ctx, header.client_id, request.base.desktop_owner);
-    const response = if (caller == null or caller.?.role != program_role_shell or caller.?.app_class != program_class_gui)
+    const caller = desktopCaller(ctx, header.client_id, request.base.desktop_owner, state);
+    const response = if (caller == null)
         r4os.abi.DisplayColorExchange{ .base = .{ .desktop_owner = request.base.desktop_owner, .status = state.display.status(display_broker.not_owner) } }
         else state.display.exchangeColor(&request);
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));

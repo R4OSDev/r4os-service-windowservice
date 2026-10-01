@@ -7,6 +7,13 @@ jeweils exakten R4DESK-Generation. R4DESK bleibt allein fuer Registry-
 Darstellung, Layout und Eingabe zustaendig; WINSVC kopiert nur die begrenzten
 Eintraege und puffert die sequenzierten Aktivierungsereignisse.
 
+Ab 0.1.11 akzeptieren Desktopoperationen neben der GUI-Bootshell auch einen
+GUI-Prozess mit aufgenommener app.role=desktop_host-Deklaration. Kernel
+0.1.238 veroeffentlicht dafuer die Maske 0x08 in ProgramInstanceInfo.flags; die
+Startrolle und das Scheduling bleiben unveraendert. Eine andere Generation
+kann bestehende Tray-/Displaybesitzer erst nach bestaetigtem Prozessende
+uebernehmen. Ausstehendes Close und unklarer Status behalten die Bindung.
+
 Projektstruktur seit 0.51.19:
 - `build.zig` baut den Service als eigenes SDK-Projekt.
 - `build.zig.zon` bindet `r4os_sdk` als Paket.
