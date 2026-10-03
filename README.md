@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.11`
+- Version: `0.1.12`
 - Image target: `/R4OS/SERVICES/WINSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -27,6 +27,16 @@ Desktop operations accept a GUI boot shell or a GUI process carrying the
 admitted `app.role=desktop_host` declaration (Kernel 0.1.238). A pending close
 or ambiguous process status retains the exact existing owner generation;
 only confirmed retirement permits rebinding to a restarted Desktop.
+
+Roadmap 0.82.27 qualifies actual GA106 WSI pixel/depth readbacks, regular
+Desktop window/fullscreen/resize/occlusion, source FP16/PQ capture, retained
+producer fences beyond Deviceclose, full Desktop restart with surviving GUI,
+and real MMU/FLR followed by fresh same-GUI pixels and exact warm retirement.
+Headless windows explicitly use an all-zero output and portable system BOs;
+the native producer's DeviceExecution fence keeps its actual GPU identity.
+Old contract layouts and slots remain unchanged. Active TV/output integration
+and manual variants stay in0.82.37/38. Evidence: GrafikVulkan07937.txt/.json
+in Docs. Existing failed results and original software/model limits remain.
 
 ## Build
 

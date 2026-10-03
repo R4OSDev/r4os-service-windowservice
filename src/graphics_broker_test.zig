@@ -101,6 +101,15 @@ pub fn check() !void {
     try cpuProducerOnPhysicalOutput();
 }
 fn cpuProducerOnPhysicalOutput() !void {
+    try systemProducerOnPhysicalOutput(false);
+    try systemProducerOnPhysicalOutput(true);
+    try systemProducerOnOutput(false, true);
+    try systemProducerOnOutput(true, true);
+}
+fn systemProducerOnPhysicalOutput(native: bool) !void {
+    try systemProducerOnOutput(native, false);
+}
+fn systemProducerOnOutput(native: bool, headless: bool) !void {
     var f: Fixture = .{};
     f.publication.config.output.adapter_id = 9;
     try t.expectEqual(a.window_graphics_invalid, f.broker.publish(&f.platform, &f.publication).result);
@@ -108,10 +117,25 @@ fn cpuProducerOnPhysicalOutput() !void {
         .device_generation = 1, .reset_generation = 1, .milestone = a.gfx_queue_milestone_cpu_stores } };
     f.platform.descriptor.location = a.gfx_buffer_location_system;
     f.platform.descriptor.adapter_id = 0; f.platform.descriptor.device_generation = 0;
+    if (headless) {
+        // Zero output is explicit. Neither a native consumer nor a partial
+        // connector identity may use the display-independent contract.
+        f.publication.config.flags |= a.window_graphics_headless;
+        try t.expectEqual(a.window_graphics_invalid, f.broker.publish(&f.platform, &f.publication).result);
+        f.publication.config.output = .{};
+        f.publication.config.backend.binding.adapter_id = 1;
+        try t.expectEqual(a.window_graphics_invalid, f.broker.publish(&f.platform, &f.publication).result);
+        f.publication.config.backend.binding.adapter_id = 0;
+        f.publication.config.flags &= ~@as(u32, a.window_graphics_headless);
+        try t.expectEqual(a.window_graphics_invalid, f.broker.publish(&f.platform, &f.publication).result);
+        f.publication.config.flags |= a.window_graphics_headless;
+    }
     try f.init(a.window_graphics_fifo);
     defer f.broker.clear(&f.platform);
     const acquired = try f.acquire();
-    const ready: a.GfxFence = .{ .slot = 1, .timeline = 1, .point = 1, .device_generation = 1, .reset_generation = 1 };
+    // The software consumer reads the portable BO after either real CPU
+    // stores or another adapter's execution fence. Keep that exact identity.
+    const ready: a.GfxFence = if (native) fence(1) else .{ .slot = 1, .timeline = 1, .point = 1, .device_generation = 1, .reset_generation = 1 };
     try f.present(acquired, ready);
     const take = f.consumer(a.window_graphics_take);
     const taken = f.broker.consumer(&f.platform, &take);

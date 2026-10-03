@@ -553,10 +553,15 @@ fn zeroFence(value: a.GfxFence) bool {
 fn validConfig(value: a.WindowGraphicsConfig) bool {
     const binding = value.backend.binding;
     if (!validHeader(value) or value.revision == 0 or value.width == 0 or value.height == 0 or value.reserved != 0 or
-        value.flags & ~@as(u32, a.window_graphics_visible) != 0 or value.min_images < 2 or value.min_images > value.max_images or value.max_images > max_images or
+        value.flags & ~@as(u32, a.window_graphics_visible | a.window_graphics_headless) != 0 or value.min_images < 2 or value.min_images > value.max_images or value.max_images > max_images or
         value.present_modes == 0 or value.present_modes & ~@as(u32, a.window_graphics_fifo | a.window_graphics_mailbox) != 0 or
         value.format_count == 0 or value.format_count > value.formats.len or !validHeader(value.backend) or !validHeader(binding) or
-        value.display_generation == 0 or value.output.connector_id == 0 or value.output.connection_generation == 0 or
+        value.display_generation == 0) return false;
+    if (value.flags & a.window_graphics_headless != 0) {
+        // The logical window belongs to Desktop, not a fabricated connector.
+        // Only the portable software consumer supports an absent output.
+        if (binding.adapter_id != 0 or !std.meta.eql(value.output, a.GfxOutputId{})) return false;
+    } else if (value.output.connector_id == 0 or value.output.connection_generation == 0 or
         value.output.device_generation == 0) return false;
     if (binding.device_generation == 0 or binding.reset_generation == 0) return false;
     if (binding.adapter_id == 0 and binding.milestone != a.gfx_queue_milestone_cpu_stores) return false;
@@ -581,11 +586,18 @@ fn validImage(chain: *const Chain, value: a.GfxBufferDescriptor) bool {
 }
 fn admitFence(platform: anytype, chain: *const Chain, fence: a.GfxFence) bool {
     const binding = chain.config.backend.binding;
-    if (!validFence(fence) or fence.adapter_id != binding.adapter_id or fence.device_generation != binding.device_generation or
-        fence.reset_generation != binding.reset_generation) return false;
+    if (!validFence(fence)) return false;
+    // A software surface imports portable system memory. Its producer may
+    // execute on a real GPU; retain/query that actual execution fence rather
+    // than substituting a CPU-store completion. Device-local chains still
+    // require their exact published adapter incarnation.
+    const system_gpu = binding.adapter_id == 0 and fence.adapter_id != 0;
+    if (!system_gpu and (fence.adapter_id != binding.adapter_id or fence.device_generation != binding.device_generation or
+        fence.reset_generation != binding.reset_generation)) return false;
     var status: a.GfxFenceStatus = .{};
     return platform.queryFence(fence, &status) and validHeader(status) and std.meta.eql(status.fence, fence) and
-        status.milestone == binding.milestone and (status.result == a.gfx_queue_result_pending or status.result == a.gfx_queue_result_complete);
+        status.milestone == (if (system_gpu) a.gfx_queue_milestone_device_execution else binding.milestone) and
+        (status.result == a.gfx_queue_result_pending or status.result == a.gfx_queue_result_complete);
 }
 fn admitConsumerFence(platform: anytype, fence: a.GfxFence) bool {
     // The final compositor/capture/scanout consumer can use another queue or
