@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.12`
+- Version: `0.1.13`
 - Image target: `/R4OS/SERVICES/WINSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
