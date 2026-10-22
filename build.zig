@@ -9,7 +9,11 @@ pub fn build(b: *std.Build) void {
     const sdk_build = b.lazyImport(@This(), "r4os_sdk") orelse return;
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
-    _ = sdk.addR4MF(b.path("module.R4MF"));
+    const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{ "../../Apps/Desktop/Contract/desktop_check_v1.zig" }) };
+    const active_wire = b.createModule(.{ .root_source_file = active_path, .target = b.graph.host });
+    _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
+        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path },
+    });
 
     const tray_broker_module = b.createModule(.{
         .root_source_file = b.path("src/tray_broker.zig"),
@@ -24,5 +28,11 @@ pub fn build(b: *std.Build) void {
     const wire = b.createModule(.{ .root_source_file = b.path("Contract/desktop_diagnostics_v1.zig"), .target = b.graph.host });
     const wire_tests = b.addRunArtifact(b.addTest(.{ .root_module = wire }));
     test_step.dependOn(&wire_tests.step);
-    b.step("desktop-test", "Bounded current Desktop diagnostic byte contract cases").dependOn(&wire_tests.step);
+    const desktop_step = b.step("desktop-test", "Bounded current Desktop diagnostic contracts and broker queue");
+    desktop_step.dependOn(&wire_tests.step);
+    const broker_module = b.createModule(.{ .root_source_file = b.path("src/desktop_checks.zig"), .target = b.graph.host });
+    broker_module.addImport("desktop_check", active_wire);
+    const broker_tests = b.addRunArtifact(b.addTest(.{ .root_module = broker_module }));
+    desktop_step.dependOn(&broker_tests.step);
+    test_step.dependOn(&broker_tests.step);
 }

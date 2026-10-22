@@ -1,6 +1,8 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const tray_broker = @import("tray_broker.zig");
+const desktop_check = @import("desktop_check");
+const desktop_checks = @import("desktop_checks.zig");
 const window_mode = @import("window_mode.zig");
 const display_broker = @import("display_broker.zig");
 const graphics_broker = @import("graphics_broker.zig");
@@ -41,6 +43,7 @@ const ServiceState = struct {
     last_error: [r4os.abi.window_service_error_bytes]u8 = .{0} ** r4os.abi.window_service_error_bytes,
     slots: [r4os.abi.window_service_max_windows]Slot = .{Slot{}} ** r4os.abi.window_service_max_windows,
     tray: tray_broker.Broker = .{},
+    desktop_checks: desktop_checks.Queue = .{},
     display: display_broker.Broker = .{},
     graphics: graphics_broker.Broker = .{},
     graphics_platform: graphics_platform.Platform = .{},
@@ -92,6 +95,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     // Endpoint identity is not sufficient after service restart. Publish the
     // actual process generation as part of every GPU surface handle.
     _ = ctx.programOpenHandle(info.instance_id, &state.graphics.service);
+    state.desktop_checks.broker = checkIdentity(state.graphics.service);
     state.modes.service = state.graphics.service;
     state.next_tray_owner_sweep_tick = ctx.ticks() +| tray_owner_sweep_ticks;
     setLastError(&state, "ready");
@@ -144,6 +148,9 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
     const payload_len: usize = @intCast(got);
     const request = service_payload[0..payload_len];
     return switch (header.op) {
+        desktop_check.operation => queueDesktopCheck(ctx, handle, header, state, request),
+        desktop_check.tray_operation => replyTrayDesktop(ctx, handle, header, state, request),
+        desktop_check.complete_operation => completeDesktopCheck(ctx, handle, header, state, request),
         desktop_diagnostics.operation => if (request.len == 0) replyDesktopDiagnostics(ctx, handle, header.request_id, state) else
             r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "BADDIAG"),
         r4os.abi.net_service_op_status,
@@ -198,11 +205,18 @@ fn nextServiceDeadline(state: *const ServiceState) ?u64 {
     var deadline = state.next_tray_owner_sweep_tick;
     if (state.tray.nextDeadline()) |value| deadline = @min(deadline, value);
     if (state.graphics.nextDeadline()) |value| deadline = @min(deadline, value);
+    if (state.desktop_checks.pending) |job| deadline = @min(deadline, job.deadline);
     return deadline;
 }
 
 fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceState) void {
     const now = ctx.ticks();
+    if (state.desktop_checks.pending) |job| {
+        if (now >= job.deadline or processHandleGone(ctx, checkHandle(job.request.caller)) or processHandleGone(ctx, checkHandle(job.desktop))) {
+            _ = ctx.serviceEndpointReply(handle, job.request_id, r4os.abi.service_api_result_timeout, "");
+            state.desktop_checks.pending = null;
+        }
+    }
     if (now >= state.next_tray_owner_sweep_tick) {
         state.next_tray_owner_sweep_tick = now +| tray_owner_sweep_ticks;
         if (tray_broker.ownerValid(state.tray.desktop_owner) and processHandleGone(ctx, state.tray.desktop_owner)) {
@@ -367,13 +381,66 @@ fn replyTrayDesktop(
     if (caller == null) {
         response = trayDesktopFailure(state, request.desktop_owner, r4os.abi.tray_result_not_owner);
     } else response = switch (header.op) {
-        r4os.abi.tray_service_op_desktop_sync => state.tray.desktopSync(&request),
+        r4os.abi.tray_service_op_desktop_sync, desktop_check.tray_operation => state.tray.desktopSync(&request),
         r4os.abi.tray_service_op_desktop_activate => state.tray.desktopActivate(&request),
         r4os.abi.tray_service_op_desktop_visibility => state.tray.desktopVisibility(&request),
         else => unreachable,
     };
     const bytes: [*]const u8 = @ptrCast(&response);
+    if (header.op == desktop_check.tray_operation) {
+        const tray_size = @sizeOf(r4os.abi.TrayDesktopExchange);
+        var bridge: [tray_size + desktop_check.work_size]u8 = undefined;
+        @memcpy(bridge[0..tray_size], bytes[0..tray_size]);
+        var work: [desktop_check.work_size]u8 = undefined;
+        desktop_check.encodeWork(&work, if (caller != null and response.result == 0)
+            state.desktop_checks.take(checkIdentity(request.desktop_owner), ctx.ticks()) else null);
+        @memcpy(bridge[tray_size..], &work);
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, &bridge);
+    }
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayDesktopExchange)]);
+}
+
+fn checkIdentity(value: r4os.abi.ProgramProcessHandle) desktop_check.Identity { return .{ .instance = value.instance_id, .generation = value.generation }; }
+fn checkHandle(value: desktop_check.Identity) r4os.abi.ProgramProcessHandle { return .{ .instance_id = value.instance, .generation = value.generation }; }
+fn queueDesktopCheck(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const request = desktop_check.decodeRequest(payload) catch
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    if (liveCaller(ctx, header.client_id, checkHandle(request.caller)) == null)
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    const desktop = state.tray.desktop_owner;
+    if (desktopCaller(ctx, desktop.instance_id, desktop, state) == null)
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_not_running, "");
+    const now = ctx.ticks();
+    if (request.deadline_tick <= now or request.deadline_tick - now > ctx.ticksFromMilliseconds(60000))
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    state.desktop_checks.submit(request, header.request_id, checkIdentity(desktop), ctx.ticks(), ctx.ticksFromMilliseconds(2000)) catch |err|
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id,
+            if (err == error.Busy) r4os.abi.service_api_result_busy else r4os.abi.service_api_result_invalid, "");
+    if (state.desktop) |desk| _ = desk.desktopActivityNotify();
+    // The public request remains parked. Only the exact Desktop completion
+    // or the real bounded cancellation/timeout replies to this request ID.
+    return 0;
+}
+
+fn completeDesktopCheck(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const ticket = desktop_check.completionTicket(payload) catch
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    const broker = desktop_check.completionBroker(payload) catch
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    const response = desktop_check.decodeResponse(payload[24..]) catch
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    if (desktopCaller(ctx, header.client_id, checkHandle(response.desktop), state) == null)
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    const job = state.desktop_checks.complete(ticket, broker, response) catch
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    const expired = ctx.ticks() >= job.deadline;
+    const delivered = ctx.serviceEndpointReply(handle, job.request_id,
+        if (expired) r4os.abi.service_api_result_timeout else 0,
+        if (expired) "" else payload[24..]);
+    // Raw delivery receipt: a cancelled caller never authorizes a deferred
+    // global restart. No normalized already-completed result is used here.
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id,
+        if (expired) r4os.abi.service_api_result_timeout else delivered, "");
 }
 
 fn replyTrayResponse(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, response: *const r4os.abi.TrayServiceResponse) i32 {

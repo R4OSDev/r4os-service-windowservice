@@ -64,3 +64,14 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+## Explicit Desktop diagnostic work
+
+The current Desktop and Spectra also share
+`../../Apps/Desktop/Contract/desktop_check_v1.zig`. This owner byte contract
+is a source dependency of the workspace build. WINSVC queues one copied,
+authenticated request and returns it in the existing Desktop tray exchange.
+Exact caller/Desktop/broker generations, a ticket and a two-second transport
+deadline reject stale work and late completion. Operation4500 stays passive.
+No app registers a service endpoint and no additional polling loop is used.
+The existing `desktop-test` step includes the bounded broker queue model.
