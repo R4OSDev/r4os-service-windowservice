@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.13`
+- Version: see `module.R4MF`
 - Image target: `/R4OS/SERVICES/WINSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -75,3 +75,8 @@ Exact caller/Desktop/broker generations, a ticket and a two-second transport
 deadline reject stale work and late completion. Operation4500 stays passive.
 No app registers a service endpoint and no additional polling loop is used.
 The existing `desktop-test` step includes the bounded broker queue model.
+Explicit benchmark sessions may declare up to300 seconds; each copied IPC
+job still expires after at most two seconds. Desktop keeps the ordinary
+CHECK limit at60 seconds and enforces the purpose of its exact reservation.
+Prepared SNES geometry is bound through the same existing own-GUI operation;
+the service never creates a child or transports a foreign process pointer.

@@ -411,7 +411,7 @@ fn queueDesktopCheck(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.a
     if (desktopCaller(ctx, desktop.instance_id, desktop, state) == null)
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_not_running, "");
     const now = ctx.ticks();
-    if (request.deadline_tick <= now or request.deadline_tick - now > ctx.ticksFromMilliseconds(60000))
+    if (request.deadline_tick <= now or request.deadline_tick - now > ctx.ticksFromMilliseconds(300000))
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
     state.desktop_checks.submit(request, header.request_id, checkIdentity(desktop), ctx.ticks(), ctx.ticksFromMilliseconds(2000)) catch |err|
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id,
