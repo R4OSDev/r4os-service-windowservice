@@ -21,4 +21,8 @@ pub fn build(b: *std.Build) void {
     const run_tray_broker_tests = b.addRunArtifact(tray_broker_tests);
     const test_step = b.step("test", "Run WINSVC Zig tests");
     test_step.dependOn(&run_tray_broker_tests.step);
+    const wire = b.createModule(.{ .root_source_file = b.path("Contract/desktop_diagnostics_v1.zig"), .target = b.graph.host });
+    const wire_tests = b.addRunArtifact(b.addTest(.{ .root_module = wire }));
+    test_step.dependOn(&wire_tests.step);
+    b.step("desktop-test", "Bounded current Desktop diagnostic byte contract cases").dependOn(&wire_tests.step);
 }

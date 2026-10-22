@@ -18,6 +18,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "Contract",
         "module.R4MF",
         "PROVENANCE.txt",
     },

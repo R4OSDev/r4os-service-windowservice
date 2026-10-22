@@ -5,6 +5,7 @@ const window_mode = @import("window_mode.zig");
 const display_broker = @import("display_broker.zig");
 const graphics_broker = @import("graphics_broker.zig");
 const graphics_platform = @import("graphics_platform.zig");
+const desktop_diagnostics = @import("desktop_diagnostics");
 
 const service_name = "WINSVC";
 const selftest_arg = "/SELFTEST";
@@ -143,6 +144,8 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
     const payload_len: usize = @intCast(got);
     const request = service_payload[0..payload_len];
     return switch (header.op) {
+        desktop_diagnostics.operation => if (request.len == 0) replyDesktopDiagnostics(ctx, handle, header.request_id, state) else
+            r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "BADDIAG"),
         r4os.abi.net_service_op_status,
         r4os.abi.window_service_op_text_status,
         => replyTextStatus(ctx, handle, header.request_id, state),
@@ -485,6 +488,51 @@ fn replyStatus(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, sta
     status_reply = makeStatus(state);
     const bytes: [*]const u8 = @ptrCast(&status_reply);
     return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceStatus)]);
+}
+
+fn replyDesktopDiagnostics(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *const ServiceState) i32 {
+    // Read the actor's existing broker copy. Never claim a host, process a
+    // deferred action, sweep an owner, acquire pixels or notify the Desktop.
+    const status = makeStatus(state);
+    var snapshot: desktop_diagnostics.Snapshot = .{
+        .service_instance = state.graphics.service.instance_id,
+        .service_generation = state.graphics.service.generation,
+        .endpoint = handle,
+        .window_count = status.window_count,
+        .window_revision = status.revision,
+        .focused_instance = status.focused_instance,
+    };
+    const owner = state.tray.desktop_owner;
+    if (liveCaller(ctx, owner.instance_id, owner)) |info| {
+        if (info.flags & r4os.abi.program_instance_flag_desktop_host != 0) {
+            snapshot.flags |= desktop_diagnostics.owner_valid;
+            snapshot.desktop_instance = owner.instance_id;
+            snapshot.desktop_generation = owner.generation;
+            snapshot.desktop_epoch = state.tray.desktop_epoch;
+            if (std.meta.eql(state.display.desktop, owner) and state.display.published.desktop_epoch == owner.generation and
+                state.display.published.revision != 0)
+            {
+                snapshot.flags |= desktop_diagnostics.display_valid;
+                snapshot.display_epoch = state.display.published.desktop_epoch;
+                snapshot.display_revision = state.display.published.revision;
+                snapshot.logical_outputs = state.display.published.layout.count;
+            }
+        }
+    }
+    var before: r4os.abi.MonotonicClockInfo = .{};
+    var after: r4os.abi.MonotonicClockInfo = .{};
+    if (ctx.monotonicClock(&before) > 0) {
+        if (ctx.monotonicNanoseconds()) |now| {
+            if (ctx.monotonicClock(&after) > 0 and before.generation != 0 and before.generation == after.generation and before.source == after.source) {
+                snapshot.flags |= desktop_diagnostics.clock_valid;
+                snapshot.collected_ns = now;
+                snapshot.clock_generation = after.generation;
+            }
+        }
+    }
+    const bytes = desktop_diagnostics.encode(&service_response, snapshot) catch
+        return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_invalid, "DIAGUNAVAILABLE");
+    return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes);
 }
 
 fn replySnapshot(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState) i32 {

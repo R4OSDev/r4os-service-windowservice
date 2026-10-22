@@ -1,4 +1,4 @@
-﻿WINSVC.R4X
+WINSVC.R4X
 ==========
 
 WINSVC.R4X ist der Window- und Task-State-Service. Seit Modulversion 0.1.3
@@ -36,3 +36,10 @@ Contract:
 - Zielpfad im Image: `C:\R4OS\SERVICES\WINSVC.R4X`
 - Tray-Ops: `0x0700` bis `0x0706` auf demselben Service-Endpoint
 - Tray-Grenzen: 16 Eintraege, 16 Besitzer, 8 Ereignisse je Besitzer
+
+0.1.14: operation4500 kopiert nur vorhandenen Brokerzustand als sprachneutralen
+128-Byte-little-endian-Vertrag1. Quelle Contract/desktop_diagnostics_v1.zig;
+Feldlayout/Scope in Docs/Diagnostics/Spectra.txt. Keine Hostaufnahme, Sweep,
+Render-/Captureanforderung oder neue Detailinstrumentierung in der Query.
+Dienst-/Desktop-Prozessgenerationen werden genau gelesen, unbekannte Gruppen
+explizit ungueltig. Build.sh desktop-test prueft Format/Breite/Unvollstaendigkeit.
