@@ -73,8 +73,8 @@ pub const Broker = struct {
         if (!owners.sameOwner(self.desktop, request.desktop_owner)) {
             self.clear(); self.desktop = request.desktop_owner; response.flags = 1;
         }
-        // A legacy Desktop cannot consume a color request. Do not truncate
-        // or acknowledge a payload that only the new exchange can carry.
+        // A geometry-only host has not admitted color requests. Keep the
+        // explicit capability boundary; never truncate/acknowledge color data.
         if (!color_capable and self.pending_color != null) { response.status = self.status(unavailable); return response; }
         if (request.status.revision < self.published.revision) { response.status = self.status(stale); return response; }
         self.published = request.status;
