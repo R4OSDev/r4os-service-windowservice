@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const sdk_build = b.lazyImport(@This(), "r4os_sdk") orelse return;
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
-    const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{ "../../Apps/Desktop/Contract/desktop_check_v1.zig" }) };
+    const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{ "../../Apps/Desktop/Contract/desktop_check_v2.zig" }) };
     const active_wire = b.createModule(.{ .root_source_file = active_path, .target = b.graph.host });
     _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
         .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path },

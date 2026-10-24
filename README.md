@@ -68,11 +68,14 @@ and `NOTICE`. Any repository-specific external material is documented in
 ## Explicit Desktop diagnostic work
 
 The current Desktop and Spectra also share
-`../../Apps/Desktop/Contract/desktop_check_v1.zig`. This owner byte contract
+`../../Apps/Desktop/Contract/desktop_check_v2.zig`. This owner byte contract
 is a source dependency of the workspace build. WINSVC queues one copied,
 authenticated request and returns it in the existing Desktop tray exchange.
 Exact caller/Desktop/broker generations, a ticket and a two-second transport
 deadline reject stale work and late completion. Operation4500 stays passive.
+The current v2 response is144 bytes; its appended counters retain their
+actual64-bit values. The explicit maximize action and committed-frame bit
+support Spectra's retained subsystem controller without a second scene owner.
 No app registers a service endpoint and no additional polling loop is used.
 The existing `desktop-test` step includes the bounded broker queue model.
 Explicit benchmark sessions may declare up to300 seconds; each copied IPC
