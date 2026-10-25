@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{ "../../Apps/Desktop/Contract/desktop_check_v2.zig" }) };
     const active_wire = b.createModule(.{ .root_source_file = active_path, .target = b.graph.host });
     _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
-        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path, b.path("Contract/desktop_launch_v1.zig") },
+        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path, b.path("Contract/desktop_launch_v1.zig"), b.path("Contract/desktop_graphics_v1.zig") },
     });
 
     const tray_broker_module = b.createModule(.{
@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     tray_broker_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    tray_broker_module.addImport("desktop_graphics", b.createModule(.{ .root_source_file = b.path("Contract/desktop_graphics_v1.zig"), .target = b.graph.host }));
     const tray_broker_tests = b.addTest(.{ .root_module = tray_broker_module });
     const run_tray_broker_tests = b.addRunArtifact(tray_broker_tests);
     const test_step = b.step("test", "Run WINSVC Zig tests");

@@ -94,11 +94,86 @@ const Fixture = struct {
 };
 
 pub fn check() !void {
+    try imageMarkers();
     try leaseAndFenceRetirement();
     try consumerCompletionBeforeProducer();
     try mailboxAndLifecycle();
     try rejectionAndWait();
     try cpuProducerOnPhysicalOutput();
+}
+fn imageMarkers() !void {
+    const wire = @import("desktop_graphics");
+    var f: Fixture = .{};
+    defer f.broker.clear(&f.platform);
+    const published = f.broker.publish(&f.platform, &f.publication);
+    f.publication.surface = published.surface;
+    const commands = f.broker.imageSnapshot(f.publication.desktop);
+    try t.expectEqual(@as(u32, 1), commands.count);
+    try t.expectEqual(@as(u32, 0), commands.rows[0].flags);
+    try t.expect(commands.rows[0].revision != 0);
+    const unchanged = f.broker.revision;
+    for (0..1000) |_| try t.expectEqualDeep(commands, f.broker.imageSnapshot(f.publication.desktop));
+    try t.expectEqual(unchanged, f.broker.revision);
+    try f.init(a.window_graphics_fifo);
+    const chain = f.broker.imageSnapshot(f.publication.desktop);
+    try t.expect(chain.rows[0].revision > commands.rows[0].revision);
+    try t.expectEqual(wire.native, chain.rows[0].flags);
+    const acquired = try f.acquire();
+    try t.expectEqualDeep(chain, f.broker.imageSnapshot(f.publication.desktop));
+    try f.present(acquired, fence(1));
+    const presented = f.broker.imageSnapshot(f.publication.desktop);
+    try t.expect(presented.rows[0].revision > chain.rows[0].revision);
+    const take = f.consumer(a.window_graphics_take);
+    const frame = f.broker.consumer(&f.platform, &take);
+    try t.expectEqual(a.window_graphics_ok, frame.result);
+    try t.expectEqualDeep(presented, f.broker.imageSnapshot(f.publication.desktop));
+    f.platform.terminal[0] = true;
+    var returning = f.consumer(a.window_graphics_return);
+    returning.image_slot = frame.image_slot; returning.acquire_token = frame.acquire_token;
+    try t.expectEqual(a.window_graphics_ok, f.broker.consumer(&f.platform, &returning).result);
+    try t.expectEqualDeep(presented, f.broker.imageSnapshot(f.publication.desktop));
+    const empty = f.consumer(a.window_graphics_take);
+    try t.expectEqual(a.window_graphics_not_ready, f.broker.consumer(&f.platform, &empty).result);
+    try t.expectEqualDeep(presented, f.broker.imageSnapshot(f.publication.desktop));
+
+    var other = f.publication;
+    other.surface = .{}; other.owner.generation += 1; other.window_id += 1;
+    try t.expectEqual(a.window_graphics_ok, f.broker.publish(&f.platform, &other).result);
+    const foreign = f.broker.imageSnapshot(f.publication.desktop);
+    try t.expect(foreign.revision > presented.revision);
+    try t.expectEqualDeep(presented.rows[0], foreign.rows[0]);
+    try t.expectEqual(@as(u32, 0), f.broker.imageSnapshot(.{ .instance_id = 2, .generation = 21 }).count);
+    const close = f.makeRequest(a.window_graphics_close_chain);
+    try t.expectEqual(a.window_graphics_ok, f.broker.client(&f.platform, &close).result);
+    const closed = f.broker.imageSnapshot(f.publication.desktop);
+    try t.expect(closed.rows[0].revision > presented.rows[0].revision);
+    try t.expectEqual(@as(u32, 0), closed.rows[0].flags);
+    try t.expectEqual(@as(usize, 0), f.platform.references);
+    f.publication.action = a.window_graphics_remove;
+    try t.expectEqual(a.window_graphics_ok, f.broker.publish(&f.platform, &f.publication).result);
+    const removed = f.broker.imageSnapshot(f.publication.desktop);
+    try t.expect(removed.rows[0].revision > closed.rows[0].revision);
+    try t.expectEqual(wire.removed, removed.rows[0].flags);
+    f.publication.action = a.window_graphics_publish; f.publication.surface = .{};
+    const fresh = f.broker.publish(&f.platform, &f.publication);
+    try t.expect(fresh.surface.serial != published.surface.serial);
+    try t.expectEqual(@as(u32, 0), f.broker.imageSnapshot(f.publication.desktop).rows[0].flags);
+
+    // Saturation is terminal for reuse, never wrap into an old valid marker.
+    f.broker.image_revision = std.math.maxInt(u64);
+    f.publication.surface = fresh.surface; f.publication.config.flags = 0;
+    _ = f.broker.publish(&f.platform, &f.publication);
+    try t.expectEqual(std.math.maxInt(u64), f.broker.imageSnapshot(f.publication.desktop).rows[0].revision);
+    var bytes: [wire.size]u8 = undefined;
+    const encoded: wire.Snapshot = .{ .service = .{ .instance = 31, .generation = 9 },
+        .desktop = .{ .instance = 5, .generation = 7 }, .revision = 7, .count = 1,
+        .rows = .{wire.Row{ .owner = .{ .instance = 8, .generation = 11 }, .window = 1, .serial = 42, .revision = 7, .flags = wire.native }} ++ .{wire.Row{}} ** (wire.capacity-1) };
+    wire.encode(&bytes, &encoded);
+    try t.expectEqualSlices(u8, "RIG1", bytes[0..4]);
+    try t.expectEqual(@as(u16, 688), std.mem.readInt(u16, bytes[6..8], .little));
+    try t.expectEqual(@as(u64, 42), std.mem.readInt(u64, bytes[64..72], .little));
+    try t.expectEqual(@as(u64, 7), std.mem.readInt(u64, bytes[80..88], .little));
+    try t.expect(std.mem.allEqual(u8, bytes[88..], 0));
 }
 fn cpuProducerOnPhysicalOutput() !void {
     try systemProducerOnPhysicalOutput(false);

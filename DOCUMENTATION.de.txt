@@ -14,6 +14,14 @@ Startrolle und das Scheduling bleiben unveraendert. Eine andere Generation
 kann bestehende Tray-/Displaybesitzer erst nach bestaetigtem Prozessende
 uebernehmen. Ausstehendes Close und unklarer Status behalten die Bindung.
 
+Seit0.1.19 liefert der private aktuelle RIG1/v1-Vertrag (Opcode4752) eine
+kopierte688Byte-Tabelle mit exakten Surface-/Produzentenrevisionen an den
+gebundenen Desktop. Keine BO-Leihe wird damit freigegeben. Attach/Acquire/
+Take/Return allein sind keine Bildaenderung; Present, Kettenwechsel und
+Widerruf benachrichtigen weiterhin. Globale Brokerrevision und Producer-Wait
+bleiben unabhaengig. Quellvertrag: Contract/desktop_graphics_v1.zig;
+fachlicher Ablauf und Abnahme: Docs/Desktop/GrafikFenstertransport07937.txt.
+
 Projektstruktur seit 0.51.19:
 - `build.zig` baut den Service als eigenes SDK-Projekt.
 - `build.zig.zon` bindet `r4os_sdk` als Paket.

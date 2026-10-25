@@ -17,8 +17,11 @@ transports generation-bound producer/consumer leases through WINSVC. It
 does not map pixels, wait on the GPU, or implement composition/color/output
 policy. Desktop and Vulkan WSI use this transport for GPU-backed windows.
 Consumers receive an explicit acknowledgement before releasing borrowed
-fence metadata. Changed graphics revisions wake the existing Desktop activity
-wait through the optional R4DESK tail; unchanged queries remain silent.
+fence metadata. Per-surface image revisions wake the existing Desktop activity wait through
+the current R4DESK API. The copied private RIG1 snapshot (opcode4752) separates
+queued-image/chain changes from consumer bookkeeping; unchanged queries and
+ordinary Take/Return operations remain silent. The global producer-wait
+revision retains its independent contract.
 The existing `test` step covers retries, fence retirement, mailbox/FIFO,
 resize and owner cleanup. See `Docs/Desktop/GrafikFenstertransport07937.txt`
 in the workspace documentation for the transport contract.

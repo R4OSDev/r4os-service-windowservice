@@ -6,6 +6,7 @@ const desktop_checks = @import("desktop_checks.zig");
 const window_mode = @import("window_mode.zig");
 const display_broker = @import("display_broker.zig");
 const graphics_broker = @import("graphics_broker.zig");
+const graphics_markers = @import("desktop_graphics");
 const graphics_platform = @import("graphics_platform.zig");
 const launch_wire = @import("desktop_launch");
 const desktop_launch = @import("desktop_launch.zig");
@@ -134,9 +135,9 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
 }
 
 fn notifyGraphics(state: *ServiceState) void {
-    if (state.graphics.revision == state.graphics_notified and state.modes.revision == state.modes_notified) return;
+    if (state.graphics.image_revision == state.graphics_notified and state.modes.revision == state.modes_notified) return;
     state.modes_notified = state.modes.revision;
-    state.graphics_notified = state.graphics.revision;
+    state.graphics_notified = state.graphics.image_revision;
     // Coalesce each drained batch after publishing its state. Ordinary tray
     // sweeps and read-only queries do not manufacture a GPU frame clock.
     if (state.desktop) |desktop| _ = desktop.desktopActivityNotify();
@@ -152,6 +153,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
     const payload_len: usize = @intCast(got);
     const request = service_payload[0..payload_len];
     return switch (header.op) {
+        graphics_markers.operation => replyGraphicsMarkers(ctx, handle, header, state, request),
         launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete => replyLaunch(ctx, handle, header, state, request),
         launch_wire.exchange => replyTrayDesktop(ctx, handle, header, state, request),
         desktop_check.operation => queueDesktopCheck(ctx, handle, header, state, request),
@@ -271,6 +273,17 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
 
 fn replyGraphicsValue(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, value: *const r4os.abi.WindowGraphicsReply) i32 {
     return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(value));
+}
+
+fn replyGraphicsMarkers(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const owner = decodeFixed(r4os.abi.ProgramProcessHandle, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    if (desktopCaller(ctx, header.client_id, owner, state) == null)
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
+    const snapshot = state.graphics.imageSnapshot(owner);
+    var bytes: [graphics_markers.size]u8 = undefined;
+    graphics_markers.encode(&bytes, &snapshot);
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, &bytes);
 }
 
 fn replyGraphics(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
