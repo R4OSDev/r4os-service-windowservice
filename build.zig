@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{ "../../Apps/Desktop/Contract/desktop_check_v2.zig" }) };
     const active_wire = b.createModule(.{ .root_source_file = active_path, .target = b.graph.host });
     _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
-        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path },
+        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path, b.path("Contract/desktop_launch_v1.zig") },
     });
 
     const tray_broker_module = b.createModule(.{
@@ -35,4 +35,11 @@ pub fn build(b: *std.Build) void {
     const broker_tests = b.addRunArtifact(b.addTest(.{ .root_module = broker_module }));
     desktop_step.dependOn(&broker_tests.step);
     test_step.dependOn(&broker_tests.step);
+    const launch_wire = b.createModule(.{ .root_source_file = b.path("Contract/desktop_launch_v1.zig"), .target = b.graph.host });
+    const launch_root = b.createModule(.{ .root_source_file = b.path("src/desktop_launch.zig"), .target = b.graph.host });
+    launch_root.addImport("desktop_launch", launch_wire);
+    const launch_tests = b.addRunArtifact(b.addTest(.{ .root_module = launch_root }));
+    b.step("launch-test", "Product launch ownership, deadlines, generations and copied wire").dependOn(&launch_tests.step);
+    test_step.dependOn(&launch_tests.step);
+
 }

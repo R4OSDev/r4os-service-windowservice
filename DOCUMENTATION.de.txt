@@ -43,3 +43,19 @@ Feldlayout/Scope in Docs/Diagnostics/Spectra.txt. Keine Hostaufnahme, Sweep,
 Render-/Captureanforderung oder neue Detailinstrumentierung in der Query.
 Dienst-/Desktop-Prozessgenerationen werden genau gelesen, unbekannte Gruppen
 explizit ungueltig. Build.sh desktop-test prueft Format/Breite/Unvollstaendigkeit.
+
+
+0.87.13 / WINSVC0.1.18: produktive Desktopstarts
+------------------------------------------------
+Contract/desktop_launch_v1.zig definiert RDL1 (448 little-endian Bytes),
+Operationen4736 Submit,4737 Status,4738 Wait,4739 Desktopaustausch,
+4740 Complete. Kopierte Queue8, Ergebnisplaetze16, Aufbewahrung bis60s
+oder Verdraengung; Kennung besteht aus exakten Broker-/Helfergenerationen.
+Wartende RPCs behalten nur die Request-ID. Callerexit storniert keinen
+angenommenen Auftrag; Desktopneustart uebertraegt keine alten Jobs.
+Der Austausch4739 traegt Trayzustand, den getrennten vorhandenen Diagnose-
+Slot und den produktiven Startauftrag. Diagnoseoperationen bleiben eigene
+Einstiege. Desktopbenachrichtigung folgt der Veroeffentlichung.
+spaete Fensterquittung allein erfuellt keinen abgelaufenen WAITFRAME-Auftrag.
+Vertrag/Bedienung/qualifizierte Grenzen: Docs/Desktop/DeskRun.txt.
+Gezielter Besitzerlauf: Build.sh launch-test; keine neue globale Testsuite.
