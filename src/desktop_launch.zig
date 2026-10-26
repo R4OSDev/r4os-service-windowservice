@@ -4,7 +4,7 @@ const std = @import("std");
 const w = @import("desktop_launch");
 pub const capacity = 8;
 pub const history_capacity = 16;
-const Slot = struct { used: bool = false, claimed: bool = false, value: w.Message = .{}, sequence: u64 = 0, retired: u64 = 0 };
+const Slot = struct { used: bool = false, claimed: bool = false, settled: bool = false, value: w.Message = .{}, sequence: u64 = 0, retired: u64 = 0 };
 const Waiter = struct { used: bool = false, key: w.Message = .{}, rpc: u32 = 0, deadline: u64 = 0 };
 pub const Reply = struct { rpc: u32, value: w.Message };
 pub const Queue = struct {
@@ -46,7 +46,7 @@ pub const Queue = struct {
                 free = s;
                 continue;
             }
-            if (!s.value.done()) active += 1 else if (oldest == null or s.sequence < oldest.?.sequence) {
+            if (!s.value.done() or (s.claimed and !s.settled)) active += 1 else if (oldest == null or s.sequence < oldest.?.sequence) {
                 oldest = s;
             }
         }
@@ -61,10 +61,13 @@ pub const Queue = struct {
     pub fn take(self: *Queue, desktop: w.Identity, now: u64) w.Message {
         var selected: ?*Slot = null;
         for (&self.slots) |*s| {
-            if (!s.used or s.value.done() or !s.value.desktop.eql(desktop)) continue;
+            if (!s.used or !s.value.desktop.eql(desktop)) continue;
             // Redeliver the SAME ticket until completion. Desktop retains its
             // execution receipt through lost transport replies and never respawns.
-            if (s.claimed) return s.value;
+            // Caller timeout does not acknowledge an asynchronous loader. Keep
+            // its mailbox and history until the Desktop returns the real result.
+            if (s.claimed and !s.settled) return s.value;
+            if (s.value.done()) continue;
             if (now >= s.value.deadline) continue;
             if (selected == null or s.sequence < selected.?.sequence) selected = s;
         }
@@ -103,6 +106,7 @@ pub const Queue = struct {
             s.value.flags |= w.terminal;
             s.retired = now;
         }
+        s.settled = s.value.done();
         return true;
     }
     pub fn status(self: *Queue, key: w.Message) w.Message {
@@ -133,8 +137,14 @@ pub const Queue = struct {
     pub fn maintain(self: *Queue, desktop: w.Identity, now: u64, retention: u64) void {
         for (&self.slots) |*s| {
             if (!s.used) continue;
+            if (s.claimed and !s.settled and !s.value.desktop.eql(desktop)) {
+                s.value.code = .desktop_lost;
+                s.value.flags |= w.terminal;
+                s.retired = now;
+                s.settled = true;
+            }
             if (s.value.done()) {
-                if (now >= s.retired +| retention) s.used = false;
+                if ((!s.claimed or s.settled) and now >= s.retired +| retention) s.used = false;
                 continue;
             }
             const failure: w.Code = if (!s.value.desktop.eql(desktop)) .desktop_lost else if (now >= s.value.deadline) .timeout else .ok;
@@ -253,4 +263,66 @@ test "late attachment never satisfies WAITFRAME after expiration" {
     try std.testing.expect(q.complete(result, 102));
     try std.testing.expectEqual(w.Code.ok, q.status(key).code);
     try std.testing.expectEqual(w.Phase.content, q.status(key).phase);
+}
+
+test "caller timeout retains the claimed mailbox until the actual late result" {
+    var q = Queue{ .broker = sample(3).broker };
+    const first = sample(3);
+    _ = q.submit(first, desk, 1);
+    var result = q.take(desk, 2);
+    var next = sample(4);
+    next.deadline = 20000;
+    _ = q.submit(next, desk, 3);
+    q.maintain(desk, 101, 60);
+    try std.testing.expectEqual(w.Code.timeout, q.status(first).code);
+    try std.testing.expect(q.take(desk, 102).sameKey(first));
+    q.maintain(desk, 10000, 60);
+    try std.testing.expect(q.take(desk, 10001).sameKey(first));
+    result.phase = .window;
+    result.process = .{ .instance = 90, .generation = 99 };
+    result.window = 2;
+    try std.testing.expect(q.complete(result, 10002));
+    try std.testing.expect(q.complete(result, 10003)); // lost ACK, same result.
+    try std.testing.expect(q.status(first).process.eql(result.process));
+    try std.testing.expect(q.take(desk, 10004).sameKey(next));
+}
+
+test "history pressure cannot evict an unacknowledged timed-out loader" {
+    var q = Queue{ .broker = sample(3).broker };
+    const first = sample(3);
+    _ = q.submit(first, desk, 1);
+    var result = q.take(desk, 2);
+    q.maintain(desk, 101, 60000);
+    for (0..history_capacity * 2) |i| {
+        const now: u64 = 102 + i * 3;
+        var other = sample(@intCast(4 + i));
+        other.deadline = now + 1;
+        try std.testing.expectEqual(w.Code.ok, q.submit(other, desk, now).code);
+        q.maintain(desk, now + 2, 60000);
+    }
+    try std.testing.expect(q.take(desk, 300).sameKey(first));
+    // The Desktop may acknowledge that its expired job never reached spawn.
+    result.code = .timeout;
+    result.flags |= w.terminal;
+    try std.testing.expect(q.complete(result, 301));
+    try std.testing.expect(q.complete(result, 302));
+    var next = sample(99);
+    next.deadline = 1000;
+    _ = q.submit(next, desk, 303);
+    try std.testing.expect(q.take(desk, 304).sameKey(next));
+    try std.testing.expect(!q.status(first).process.valid());
+}
+
+test "desktop replacement settles an expired claim without transferring it" {
+    var q = Queue{ .broker = sample(3).broker };
+    const first = sample(3);
+    _ = q.submit(first, desk, 1);
+    _ = q.take(desk, 2);
+    q.maintain(desk, 101, 60);
+    const replacement = w.Identity{ .instance = desk.instance, .generation = desk.generation + 1 };
+    q.maintain(replacement, 102, 60);
+    try std.testing.expectEqual(w.Code.desktop_lost, q.status(first).code);
+    try std.testing.expect(!q.take(replacement, 103).request.valid());
+    q.maintain(replacement, 163, 60);
+    try std.testing.expectEqual(w.Code.unknown, q.status(first).code);
 }
