@@ -75,3 +75,76 @@ prueft und kopiert weiterhin identisch Caller/Generation/Ticket/Deadline und
 exakte Desktopantwort; Request80/Response144/Work120 bleiben bytegleich. Die
 passive Metrics-Abfrage bleibt unveraendert; nur der Desktopowner schreibt den
 explizit angeforderten callerqualifizierten Capturebericht.
+
+0.87.60 / WINSVC0.1.23: Diagnosearbeit nach realer Zustellung uebernehmen
+-----------------------------------------------------------------------
+SPEED-054: Ein Diagnoseauftrag darf erst nach wirklicher IPC-Zustellung als
+claimed gelten. offer aendert keinen Claim. Nur serviceEndpointReply roh0
+und dasselbe Ticket/Broker/Request/Deadline bestaetigen die Zustellung; erst
+danach wird fuer den Servicehandler ein abgebrochener Caller nichtfatal
+normalisiert. Negative oder alte Receipts beanspruchen keinen Ersatzauftrag.
+Die produktive Launchmailbox behaelt ihre vorhandene idempotente Wiederzustellung.
+
+Der vorhandene Queuefall reproduziert den verlorenen unbestaetigten Auftrag
+und prueft Cancelled-2/echte0/falschenBroker/spaeteQuittung/Original-Wire/Launch.
+Original250msTray/2sBroker/3sCaller und alle Ressourcenvertraege bleiben.
+Es gibt keinen neuen Thread, Sampler oder Plattform-/SDK-/Wirevertrag.
+
+Fehlerquittungen liegen ausschliesslich als Werte beim Broker: vier letzte
+Receipts und ein Gesamtzaehler, der moegliches Ueberschreiben sichtbar macht.
+SERVMAN STATUS WINSVC liest sie im vorhandenen Textstatus. Erst diese explizite
+Abfrage formatiert Phase(delivery/expiry/completed_late), Originalauftrag,
+Caller/Target/Desktop, submitted/delivered/deadline/now, rohes Replyergebnis und
+ein vorhandenes Ownerresultat. Die Werte sind einzelne Ereigniszeiten, keine
+atomare Mehrphasenmessung. completed_late unterscheidet die tatsaechliche
+verspaetete Desktopantwort von einem beim Broker auslaufenden Auftrag.
+Der Broker ruft fuer diese Diagnose keinen synchronen LOGSVC und schreibt
+keine Datei/Seriellausgabe. Zusatzclock nur bei wirklich angebotenem Diagnosejob.
+
+Hostfaelle und23Build gruen; erneute aktuelleKVM/Nativequalifikation offen.
+Erster60KVMFocus37 und ersterNativeBind38 bleiben gesonderte fehlgeschlagene
+Originale. Aus dem Quellfix oder spaeteren Passes folgt keine alteUrsache.
+
+0.87.60 WIP / WINSVC24: publizierte Antwort ist noch kein Konsum-ACK
+-------------------------------------------------------------------
+Kernel.reply setzt REQUEST_RESPONDED und liefert roh0. Ein spaeter
+wiederlaufender Client prueft in take_response_inner aber zuerst seine
+Frist und kann die Antwort ungenutzt als Timeout verwerfen. claimed im
+internen Job beschreibt daher nur eine erste rohe Antwortpublikation.
+
+Die gleiche kopierte Arbeit wird bis zur eindeutigen Completion weiter
+angeboten. Ticket/Broker/Request/2sDeadline bleiben identisch. Desktop177
+behaelt die kopierte Antwort und fuehrt denselben Auftrag nicht erneut
+aus. delivered_at behaelt die erste Publikation; falsche, ersetzte und
+abgelaufene Angebote koennen keine neue Arbeit beanspruchen. Keine
+weitere Queue, Fristverlaengerung oder neue produktive RPC-Schleife.
+VorhandenerQueuefall reproduziert die alte claimed/keinAngebot-Luecke;
+alle15 bestehenden Wire-/Broker-/Launchfaelle und normaler24Build bestehen.
+Diese Quellluecke ist kein Ursachennachweis fuer den separaten Q5-Fehler
+logical-key-delivery. Gesamte aktuelle KVM-/Nativeabnahme noch offen.
+
+28.10.2026 aktuelle Funktionsabnahme0.87.60
+-----------------------------------------
+Aktuell Desktop177/WINSVC24/Spectra91/NVIDIA336, Kernel417/SDK105/Contract54
+und Audioartefakte bytegleich zum qualifizierten Vorstand. Betroffene18Rust-
+Owner/3Geometrie/1Clock,15WINSVC-Wire/Broker/Launchfaelle, originaler echter
+NVIDIA-Device/Power-Owner und normale Produktbuilds bestehen. KVM4 Q6
+besteht die unveraenderten Desktop- und langen60sBASIC/GB/SNES-Originale
+mit exakten Ressourcenquittungen und normalem Poweroff.
+
+OssiPC16: vier installierte Komponenten vollbytegleich/CONFIG503original/
+AutoNVIDIA336; Native4 ohne Beobachtungsfixture mit neuer Glyphe, completed
+AtlasReuse58->67/CaptureReuse77->131/visible12->19/2echtenGPUimages/Fences/
+ReadReturn/3Exit0reaps/Rest0. Displaygeneration+Reset unveraendert, kopierte
+Hostfehlertotale0. OriginalsequenziellesGAP/PCM/Progress/HDA/Desktop gruen.
+NormalerPostGPUreboot54.382s belegt aktuelle resources0/nativeDMAstopped/
+driverDisplayshutdownOK, dabei terminalerFLR. Kein pauschalergraceful oder
+Hotmodulunload-/physischerSichtHoerLatenzclaim. Vorige Native1/2/3- und Q5-
+Keyfehler bleiben getrennte Originale fuer66; der aktuelle Pass isoliert
+deren Ursachen nicht vollstaendig. Details in Docs/Core/Parallelitaet.txt.
+FinalerSTANDARD60: 87c87a4d-427c-4a9f-8c22-ac49e189dd03; Suite3/metric2/30Samples/4Worker/6Scores
+lokal und R4OS Server vollstaendig validiert, komplettes Original und frischer
+ReferenzGET normalisiert gleich; OriginalSHA256 d538b089c24b973ba14209cdad415fed71781af10051eebbc58f95e684517efd.
+Gesamt135.521406/IPC141.872165 gegen59 137.870960/146.849660 unisoliert;
+keinSpeedup-/Noise-/Regressionsursachenbeweis und keinScore-/Uploadrerun.
+Alle Originale/Kontexte/SHA256 unter ExFiles/Reports/Benchmarks/87c87a4d-427c-4a9f-8c22-ac49e189dd03/.

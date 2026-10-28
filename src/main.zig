@@ -222,8 +222,9 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
     const now = ctx.ticks();
     if (state.desktop_checks.pending) |job| {
         if (now >= job.deadline or processHandleGone(ctx, checkHandle(job.request.caller)) or processHandleGone(ctx, checkHandle(job.desktop))) {
-            _ = ctx.serviceEndpointReply(handle, job.request_id, r4os.abi.service_api_result_timeout, "");
             state.desktop_checks.pending = null;
+            const raw = ctx.serviceEndpointReply(handle, job.request_id, r4os.abi.service_api_result_timeout, "");
+            state.desktop_checks.recordFault(.{ .phase = .expiry, .job = job, .raw = raw, .now = now });
         }
     }
     if (now >= state.next_tray_owner_sweep_tick) {
@@ -414,23 +415,39 @@ fn replyTrayDesktop(
         const tray_size = @sizeOf(r4os.abi.TrayDesktopExchange);
         var bridge: [tray_size + desktop_check.work_size + launch_wire.size]u8 = undefined;
         @memcpy(bridge[0..tray_size], bytes[0..tray_size]);
-        desktop_check.encodeWork(bridge[tray_size..][0..desktop_check.work_size], if (caller != null and response.result == 0)
-            state.desktop_checks.take(checkIdentity(request.desktop_owner), ctx.ticks()) else null);
+        const offered = if (caller != null and response.result == 0)
+            state.desktop_checks.offer(checkIdentity(request.desktop_owner), ctx.ticks()) else null;
+        desktop_check.encodeWork(bridge[tray_size..][0..desktop_check.work_size], offered);
         launch_wire.encode(bridge[tray_size + desktop_check.work_size..][0..launch_wire.size], if (caller != null and response.result == 0)
             state.launches.take(launchIdentity(request.desktop_owner), ctx.ticks()) else .{ .broker = state.launches.broker });
-        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, &bridge);
+        return replyDesktopOffer(ctx, handle, header.request_id, state, offered, &bridge);
     }
     if (header.op == desktop_check.tray_operation) {
         const tray_size = @sizeOf(r4os.abi.TrayDesktopExchange);
         var bridge: [tray_size + desktop_check.work_size]u8 = undefined;
         @memcpy(bridge[0..tray_size], bytes[0..tray_size]);
         var work: [desktop_check.work_size]u8 = undefined;
-        desktop_check.encodeWork(&work, if (caller != null and response.result == 0)
-            state.desktop_checks.take(checkIdentity(request.desktop_owner), ctx.ticks()) else null);
+        const offered = if (caller != null and response.result == 0)
+            state.desktop_checks.offer(checkIdentity(request.desktop_owner), ctx.ticks()) else null;
+        desktop_check.encodeWork(&work, offered);
         @memcpy(bridge[tray_size..], &work);
-        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, &bridge);
+        return replyDesktopOffer(ctx, handle, header.request_id, state, offered, &bridge);
     }
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.TrayDesktopExchange)]);
+}
+
+fn replyDesktopOffer(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState, offered: ?desktop_check.Work, payload: []const u8) i32 {
+    const raw = ctx.serviceEndpointReply(handle, request_id, 0, payload);
+    if (offered != null) {
+        const now = ctx.ticks(); // Only explicitly offered diagnostic work.
+        if (raw != 0) if (state.desktop_checks.pending) |job| {
+            state.desktop_checks.recordFault(.{ .phase = .delivery, .job = job, .raw = raw, .now = now });
+        };
+        _ = state.desktop_checks.delivered(offered, raw, now);
+    }
+    // A cancelled tray caller is nonfatal to the loop, but is not a delivery
+    // receipt. Product launch tickets retain their existing redelivery policy.
+    return r4os.app_services.completedReplyResult(raw);
 }
 
 fn launchIdentity(value: r4os.abi.ProgramProcessHandle) launch_wire.Identity { return .{ .instance = value.instance_id, .generation = value.generation }; }
@@ -505,10 +522,12 @@ fn completeDesktopCheck(ctx: *const r4os.r4sys.Context, handle: u32, header: r4o
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
     const job = state.desktop_checks.complete(ticket, broker, response) catch
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
-    const expired = ctx.ticks() >= job.deadline;
+    const completed_at = ctx.ticks();
+    const expired = completed_at >= job.deadline;
     const delivered = ctx.serviceEndpointReply(handle, job.request_id,
         if (expired) r4os.abi.service_api_result_timeout else 0,
         if (expired) "" else payload[24..]);
+    if (expired) state.desktop_checks.recordFault(.{ .phase = .completed_late, .job = job, .raw = delivered, .now = completed_at, .owner_result = response.result });
     // Raw delivery receipt: a cancelled caller never authorizes a deferred
     // global restart. No normalized already-completed result is used here.
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id,
@@ -619,6 +638,21 @@ fn replyTextStatus(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32,
     writer.writeU64(status_reply.revision);
     writer.write(" last=");
     writer.write(spanZ(status_reply.last_error[0..]));
+    if (state.desktop_checks.fault_count != 0) {
+        writer.write(" check-faults=");
+        writer.writeU64(state.desktop_checks.fault_count);
+        writer.write(" retained<=4");
+        for (0..state.desktop_checks.faults.len) |offset| {
+            const fault = state.desktop_checks.faults[(state.desktop_checks.fault_next + offset) % state.desktop_checks.faults.len] orelse continue;
+            var detail: [512]u8 = undefined;
+            const text = std.fmt.bufPrint(&detail, "\r\ncheck-fault phase={s} op={s} ticket={d} claimed={} caller={d}/{d} desktop={d}/{d} target={d}/{d} submitted={d} delivered={d} deadline={d} now={d} raw={d} owner-result={?d}", .{
+                @tagName(fault.phase), @tagName(fault.job.request.op), fault.job.ticket, fault.job.claimed,
+                fault.job.request.caller.instance, fault.job.request.caller.generation, fault.job.desktop.instance, fault.job.desktop.generation,
+                fault.job.request.target.instance, fault.job.request.target.generation, fault.job.submitted_at, fault.job.delivered_at, fault.job.deadline, fault.now, fault.raw, fault.owner_result,
+            }) catch "\r\ncheck-fault metadata overflow";
+            writer.write(text);
+        }
+    }
     return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, writer.slice());
 }
 
