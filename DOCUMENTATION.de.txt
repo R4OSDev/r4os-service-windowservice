@@ -67,3 +67,11 @@ Einstiege. Desktopbenachrichtigung folgt der Veroeffentlichung.
 spaete Fensterquittung allein erfuellt keinen abgelaufenen WAITFRAME-Auftrag.
 Vertrag/Bedienung/qualifizierte Grenzen: Docs/Desktop/DeskRun.txt.
 Gezielter Besitzerlauf: Build.sh launch-test; keine neue globale Testsuite.
+
+0.87.59 / WINSVC0.1.21
+---------------------
+Der private Desktopcheckvertrag kennt zusaetzlich CaptureStats23. Der Broker
+prueft und kopiert weiterhin identisch Caller/Generation/Ticket/Deadline und
+exakte Desktopantwort; Request80/Response144/Work120 bleiben bytegleich. Die
+passive Metrics-Abfrage bleibt unveraendert; nur der Desktopowner schreibt den
+explizit angeforderten callerqualifizierten Capturebericht.
