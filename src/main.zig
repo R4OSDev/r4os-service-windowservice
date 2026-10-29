@@ -20,6 +20,174 @@ const tray_owner_sweep_ticks: u64 = 50;
 const program_class_gui: u8 = 1;
 const program_state_done: u8 = 2;
 
+// Test-only callers reference this transport probe; it is not reachable from
+// the product entry point and adds no production measurement or hook.
+const SweepProbe = struct {
+    var calls: usize = 0;
+    var now: u64 = 1000;
+    var error_result: i32 = 0;
+    var ended_generation: ?u64 = null;
+    fn reset() void {
+        calls = 0;
+        now = 1000;
+        error_result = 0;
+        ended_generation = null;
+    }
+    fn ticks() callconv(.c) u64 {
+        return now;
+    }
+    fn status(owner: *const r4os.abi.ProgramProcessHandle, out: *r4os.abi.ProgramInstanceInfo) callconv(.c) i32 {
+        calls += 1;
+        if (error_result != 0) return error_result;
+        if (ended_generation == owner.generation) return r4os.abi.program_handle_error_stale;
+        out.* = .{ .id = owner.instance_id, .state = 1 };
+        return r4os.abi.program_handle_ok;
+    }
+};
+
+const SweepFixture = struct {
+    raw: r4os.abi.R4XStartContext = .{},
+    table: r4os.abi.R4XStartR4Sys = .{},
+    bundle: r4os.program.Bundle = undefined,
+    fn context(self: *SweepFixture) r4os.r4sys.Context {
+        self.table.ticks = @intFromPtr(&SweepProbe.ticks);
+        self.table.program_handle_status = @intFromPtr(&SweepProbe.status);
+        self.bundle = .{ .raw = &self.raw, .sys = &self.table };
+        return r4os.r4sys.Context.init(&self.bundle);
+    }
+};
+
+test "WINSVC maintenance empty service has no periodic owner deadline" {
+    const state = ServiceState{};
+    try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
+}
+
+test "WINSVC maintenance one exact owner is queried once across actual brokers" {
+    var raw: r4os.abi.R4XStartContext = .{};
+    var table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&SweepProbe.ticks), .program_handle_status = @intFromPtr(&SweepProbe.status) };
+    var bundle: r4os.program.Bundle = .{ .raw = &raw, .sys = &table };
+    const ctx = r4os.r4sys.Context.init(&bundle);
+    var state = ServiceState{};
+    const owner: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    _ = state.tray.bindDesktop(owner);
+    state.display.desktop = owner;
+    state.graphics.surfaces[0].identity = .{ .desktop = owner, .owner = owner, .serial = 1 };
+    state.modes.slots[0].identity = .{ .desktop = owner, .owner = owner, .serial = 1 };
+    state.next_tray_owner_sweep_tick = 1000;
+    SweepProbe.reset();
+    maintainTray(&ctx, 1, &state);
+    try std.testing.expectEqual(@as(usize, 1), SweepProbe.calls);
+}
+
+test "WINSVC maintenance owner interest arms preserves and disarms its deadline" {
+    var state = ServiceState{};
+    refreshOwnerSweep(&state, 1000);
+    try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
+    try std.testing.expect(state.tray.bindDesktop(.{ .instance_id = 9, .generation = 100 }));
+    refreshOwnerSweep(&state, 1000);
+    try std.testing.expectEqual(@as(?u64, 1050), nextServiceDeadline(&state));
+    refreshOwnerSweep(&state, 1010);
+    try std.testing.expectEqual(@as(?u64, 1050), nextServiceDeadline(&state));
+    _ = state.tray.clearDesktop();
+    refreshOwnerSweep(&state, 1020);
+    try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
+}
+
+test "WINSVC maintenance unknown status is retained and next sweep refreshes it" {
+    var fixture: SweepFixture = .{};
+    const ctx = fixture.context();
+    var state = ServiceState{};
+    const owner: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    _ = state.tray.bindDesktop(owner);
+    state.display.desktop = owner;
+    state.next_tray_owner_sweep_tick = 1000;
+    SweepProbe.reset();
+    SweepProbe.error_result = -123; // An unclassified query failure is not proof of death.
+    maintainTray(&ctx, 1, &state);
+    try std.testing.expectEqual(@as(usize, 1), SweepProbe.calls);
+    try std.testing.expectEqualDeep(owner, state.tray.desktop_owner);
+    try std.testing.expectEqualDeep(owner, state.display.desktop);
+    try std.testing.expectEqual(@as(?u64, 1050), state.next_tray_owner_sweep_tick);
+    SweepProbe.now = 1050;
+    SweepProbe.error_result = 0;
+    SweepProbe.ended_generation = owner.generation;
+    maintainTray(&ctx, 1, &state);
+    try std.testing.expectEqual(@as(usize, 2), SweepProbe.calls);
+    try std.testing.expect(!tray_broker.ownerValid(state.tray.desktop_owner));
+    try std.testing.expect(!tray_broker.ownerValid(state.display.desktop));
+    try std.testing.expectEqual(@as(?u64, null), state.next_tray_owner_sweep_tick);
+}
+
+test "WINSVC maintenance same numeric ID with new generation is a distinct query" {
+    var fixture: SweepFixture = .{};
+    const ctx = fixture.context();
+    var state = ServiceState{};
+    const old: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    const fresh: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 101 };
+    _ = state.tray.bindDesktop(old);
+    state.display.desktop = fresh;
+    state.next_tray_owner_sweep_tick = 1000;
+    SweepProbe.reset();
+    SweepProbe.ended_generation = old.generation;
+    maintainTray(&ctx, 1, &state);
+    try std.testing.expectEqual(@as(usize, 2), SweepProbe.calls);
+    try std.testing.expect(!tray_broker.ownerValid(state.tray.desktop_owner));
+    try std.testing.expectEqualDeep(fresh, state.display.desktop);
+}
+
+test "WINSVC maintenance many surfaces reuse two owners and removed surfaces keep Desktop watch" {
+    var fixture: SweepFixture = .{};
+    const ctx = fixture.context();
+    var state = ServiceState{};
+    const desktop: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    const producer: r4os.abi.ProgramProcessHandle = .{ .instance_id = 10, .generation = 101 };
+    _ = state.tray.bindDesktop(desktop);
+    state.display.desktop = desktop;
+    for (&state.graphics.surfaces, 0..) |*surface, i| surface.identity = .{ .desktop = desktop, .owner = producer, .serial = i + 1 };
+    for (&state.modes.slots, 0..) |*slot, i| slot.identity = .{ .desktop = desktop, .owner = producer, .serial = i + 1 };
+    state.next_tray_owner_sweep_tick = 1000;
+    SweepProbe.reset();
+    maintainTray(&ctx, 1, &state);
+    try std.testing.expectEqual(@as(usize, 2), SweepProbe.calls);
+    state = .{};
+    state.graphics.surfaces[0].identity = .{ .desktop = desktop, .owner = producer, .serial = 1 };
+    state.graphics.surfaces[0].removed = true;
+    state.next_tray_owner_sweep_tick = 1000;
+    SweepProbe.reset();
+    maintainTray(&ctx, 1, &state);
+    try std.testing.expectEqual(@as(usize, 1), SweepProbe.calls);
+    try std.testing.expectEqual(@as(?u64, 1050), state.next_tray_owner_sweep_tick);
+}
+
+test "WINSVC maintenance pending wait launch and diagnostic deadlines remain independent" {
+    var state = ServiceState{};
+    const owner: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    state.tray.owners[0] = .{ .used = true, .owner = owner, .waiter = .{ .owner = owner, .request_id = 1, .deadline_tick = 1400, .after_sequence = 0 } };
+    try std.testing.expectEqual(@as(?u64, 1400), nextServiceDeadline(&state));
+    state.graphics.waiters[0] = .{ .request_id = 2, .request = .{ .owner = owner, .deadline_tick = 1300 } };
+    try std.testing.expectEqual(@as(?u64, 1300), nextServiceDeadline(&state));
+    state.launches.waiters[0] = .{ .used = true, .rpc = 3, .deadline = 1200 };
+    try std.testing.expectEqual(@as(?u64, 1200), nextServiceDeadline(&state));
+    state.desktop_checks.pending = .{ .ticket = 1, .request_id = 4, .request = .{ .op = .snapshot, .caller = .{ .instance = 9, .generation = 100 }, .deadline_tick = 1100 }, .desktop = .{ .instance = 9, .generation = 100 }, .deadline = 1100, .submitted_at = 1000 };
+    try std.testing.expectEqual(@as(?u64, 1100), nextServiceDeadline(&state));
+    state.next_tray_owner_sweep_tick = 1050;
+    try std.testing.expectEqual(@as(?u64, 1050), nextServiceDeadline(&state));
+    state.next_tray_owner_sweep_tick = null;
+    state.desktop_checks.pending = null;
+    try std.testing.expectEqual(@as(?u64, 1200), nextServiceDeadline(&state));
+}
+
+test "WINSVC maintenance memo admits the complete derived owner bound without truncation" {
+    var fixture: SweepFixture = .{};
+    const ctx = fixture.context();
+    var checks: OwnerChecks = .{};
+    SweepProbe.reset();
+    for (0..OwnerChecks.capacity) |i| try std.testing.expect(!checks.gone(&ctx, .{ .instance_id = @intCast(i + 1), .generation = i + 100 }));
+    try std.testing.expectEqual(OwnerChecks.capacity, SweepProbe.calls);
+    for (0..OwnerChecks.capacity) |i| try std.testing.expect(!checks.gone(&ctx, .{ .instance_id = @intCast(i + 1), .generation = i + 100 }));
+    try std.testing.expectEqual(OwnerChecks.capacity, SweepProbe.calls);
+}
+
 const Slot = struct {
     used: bool = false,
     record: r4os.abi.WindowServiceRecord = .{},
@@ -55,7 +223,7 @@ const ServiceState = struct {
     graphics_notified: u64 = 1,
     modes: window_mode.Broker = .{},
     modes_notified: u64 = 1,
-    next_tray_owner_sweep_tick: u64 = 0,
+    next_tray_owner_sweep_tick: ?u64 = null,
 };
 
 var service_payload: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4os.abi.service_api_max_payload;
@@ -116,7 +284,6 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     state.launches.broker = launchIdentity(state.graphics.service);
     state.launches.evidence = .{ .context = ctx, .retain = retainLaunchEvidence, .release = releaseLaunchEvidence };
     state.modes.service = state.graphics.service;
-    state.next_tray_owner_sweep_tick = ctx.ticks() +| tray_owner_sweep_ticks;
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(ctx.*, handle, .{});
     while (true) {
@@ -128,6 +295,9 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
                     _ = ctx.serviceEndpointUnregister(handle);
                     return rc;
                 }
+                // Owner identities are introduced by endpoint operations.
+                // Do not repeatedly scan empty tables on the central Stop wake.
+                refreshOwnerSweep(&state, ctx.ticks());
             },
             .idle, .deadline => {},
             .stop => break,
@@ -224,49 +394,89 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
 
 fn nextServiceDeadline(state: *const ServiceState) ?u64 {
     var deadline = state.next_tray_owner_sweep_tick;
-    if (state.tray.nextDeadline()) |value| deadline = @min(deadline, value);
-    if (state.graphics.nextDeadline()) |value| deadline = @min(deadline, value);
-    if (state.launches.deadline()) |value| deadline = @min(deadline, value);
-    if (state.desktop_checks.pending) |job| deadline = @min(deadline, job.deadline);
+    if (state.tray.nextDeadline()) |value| deadline = @min(deadline orelse value, value);
+    if (state.graphics.nextDeadline()) |value| deadline = @min(deadline orelse value, value);
+    if (state.launches.deadline()) |value| deadline = @min(deadline orelse value, value);
+    if (state.desktop_checks.pending) |job| deadline = @min(deadline orelse job.deadline, job.deadline);
     return deadline;
 }
 
+fn hasSweepOwners(state: *const ServiceState) bool {
+    if (tray_broker.ownerValid(state.tray.desktop_owner) or tray_broker.ownerValid(state.display.desktop)) return true;
+    // Removed surfaces can still own chains until the Desktop ends. Their
+    // liveness obligation remains; GPU fences are not periodically polled.
+    for (&state.graphics.surfaces) |*surface| if (surface.identity.serial != 0) return true;
+    for (&state.modes.slots) |*slot| if (slot.identity.serial != 0) return true;
+    return state.tray.ownerAt(0) != null;
+}
+
+fn refreshOwnerSweep(state: *ServiceState, now: u64) void {
+    if (!hasSweepOwners(state)) {
+        state.next_tray_owner_sweep_tick = null;
+    } else if (state.next_tray_owner_sweep_tick == null) {
+        state.next_tray_owner_sweep_tick = now +| tray_owner_sweep_ticks;
+    }
+}
+
+const OwnerChecks = struct {
+    // Derived from every identity visited by this maintenance adapter, not a
+    // new live-owner quota. Only the initialized prefix is read; idle wakes
+    // never zero or allocate a whole temporary cache.
+    const capacity = 2 + graphics_broker.max_surfaces * 2 + r4os.abi.window_service_max_windows * 2 + tray_broker.max_owners + 2;
+    const Entry = struct { owner: r4os.abi.ProgramProcessHandle, gone: bool };
+    entries: [capacity]Entry = undefined,
+    count: usize = 0,
+
+    fn gone(self: *OwnerChecks, ctx: *const r4os.r4sys.Context, owner: r4os.abi.ProgramProcessHandle) bool {
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.owner.instance_id == owner.instance_id and entry.owner.generation == owner.generation and entry.owner.reserved == owner.reserved) return entry.gone;
+        }
+        const result = processHandleGone(ctx, owner);
+        std.debug.assert(self.count < self.entries.len);
+        self.entries[self.count] = .{ .owner = owner, .gone = result };
+        self.count += 1;
+        return result;
+    }
+};
+
 fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceState) void {
     const now = ctx.ticks();
+    var checks: OwnerChecks = .{};
     if (state.desktop_checks.pending) |job| {
-        if (now >= job.deadline or processHandleGone(ctx, checkHandle(job.request.caller)) or processHandleGone(ctx, checkHandle(job.desktop))) {
+        if (now >= job.deadline or checks.gone(ctx, checkHandle(job.request.caller)) or checks.gone(ctx, checkHandle(job.desktop))) {
             state.desktop_checks.pending = null;
             const raw = ctx.serviceEndpointReply(handle, job.request_id, r4os.abi.service_api_result_timeout, "");
             state.desktop_checks.recordFault(.{ .phase = .expiry, .job = job, .raw = raw, .now = now });
         }
     }
-    if (now >= state.next_tray_owner_sweep_tick) {
-        state.next_tray_owner_sweep_tick = now +| tray_owner_sweep_ticks;
-        if (tray_broker.ownerValid(state.tray.desktop_owner) and processHandleGone(ctx, state.tray.desktop_owner)) {
+    if (state.next_tray_owner_sweep_tick != null and now >= state.next_tray_owner_sweep_tick.?) {
+        if (tray_broker.ownerValid(state.tray.desktop_owner) and checks.gone(ctx, state.tray.desktop_owner)) {
             _ = state.tray.clearDesktop();
         }
-        if (tray_broker.ownerValid(state.display.desktop) and processHandleGone(ctx, state.display.desktop)) state.display.clear();
+        if (tray_broker.ownerValid(state.display.desktop) and checks.gone(ctx, state.display.desktop)) state.display.clear();
         // This sweep checks process liveness only. GPU fences are inspected
         // on producer/consumer operations, never periodically polled here.
         for (&state.graphics.surfaces) |*surface| {
             if (surface.identity.serial == 0) continue;
             const desktop = surface.identity.desktop;
             const owner = surface.identity.owner;
-            if (processHandleGone(ctx, desktop)) state.graphics.removeOwner(&state.graphics_platform, desktop);
-            if (!surface.removed and processHandleGone(ctx, owner)) state.graphics.removeOwner(&state.graphics_platform, owner);
+            if (checks.gone(ctx, desktop)) state.graphics.removeOwner(&state.graphics_platform, desktop);
+            if (!surface.removed and checks.gone(ctx, owner)) state.graphics.removeOwner(&state.graphics_platform, owner);
         }
 
         for (&state.modes.slots) |*slot| {
             if (slot.identity.serial == 0) continue;
             const identity = slot.identity;
-            if (processHandleGone(ctx, identity.desktop)) state.modes.removeOwner(identity.desktop);
-            if (processHandleGone(ctx, identity.owner)) state.modes.removeOwner(identity.owner);
+            if (checks.gone(ctx, identity.desktop)) state.modes.removeOwner(identity.desktop);
+            if (checks.gone(ctx, identity.owner)) state.modes.removeOwner(identity.owner);
         }
         var cursor: usize = 0;
         while (state.tray.ownerAt(cursor)) |found| {
             cursor = found.index + 1;
-            if (processHandleGone(ctx, found.owner)) _ = state.tray.removeOwner(found.owner);
+            if (checks.gone(ctx, found.owner)) _ = state.tray.removeOwner(found.owner);
         }
+        state.next_tray_owner_sweep_tick = null;
+        refreshOwnerSweep(state, now);
     }
 
     state.launches.maintain(launchIdentity(state.tray.desktop_owner), now, ctx.ticksFromMilliseconds(60000));

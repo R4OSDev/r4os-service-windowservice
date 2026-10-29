@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const sdk_build = b.lazyImport(@This(), "r4os_sdk") orelse return;
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
-    const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{ "../../Apps/Desktop/Contract/desktop_check_v2.zig" }) };
+    const active_path: std.Build.LazyPath = .{ .cwd_relative = b.pathResolve(&.{"../../Apps/Desktop/Contract/desktop_check_v2.zig"}) };
     const active_wire = b.createModule(.{ .root_source_file = active_path, .target = b.graph.host });
     _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
         .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path, b.path("Contract/desktop_launch_v1.zig"), b.path("Contract/desktop_graphics_v1.zig") },
@@ -43,4 +43,14 @@ pub fn build(b: *std.Build) void {
     b.step("launch-test", "Product launch ownership, deadlines, generations and copied wire").dependOn(&launch_tests.step);
     test_step.dependOn(&launch_tests.step);
 
+    // Exercise the actual service maintenance adapter and its real brokers.
+    const maintenance_root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host });
+    maintenance_root.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    maintenance_root.addImport("desktop_check", active_wire);
+    maintenance_root.addImport("desktop_diagnostics", wire);
+    maintenance_root.addImport("desktop_launch", launch_wire);
+    maintenance_root.addImport("desktop_graphics", b.createModule(.{ .root_source_file = b.path("Contract/desktop_graphics_v1.zig"), .target = b.graph.host }));
+    const maintenance_tests = b.addRunArtifact(b.addTest(.{ .root_module = maintenance_root, .filters = &.{"WINSVC maintenance"} }));
+    b.step("owner-test", "Actual WINSVC owner sweep, exact generations and deadlines").dependOn(&maintenance_tests.step);
+    test_step.dependOn(&maintenance_tests.step);
 }
