@@ -4,10 +4,18 @@ const std = @import("std");
 const w = @import("desktop_launch");
 pub const capacity = 8;
 pub const history_capacity = 16;
-const Slot = struct { used: bool = false, claimed: bool = false, settled: bool = false, value: w.Message = .{}, sequence: u64 = 0, retired: u64 = 0 };
+const Slot = struct { used: bool = false, claimed: bool = false, settled: bool = false, value: w.Message = .{}, sequence: u64 = 0, retired: u64 = 0, evidence: u64 = 0 };
 const Waiter = struct { used: bool = false, key: w.Message = .{}, rpc: u32 = 0, deadline: u64 = 0 };
 pub const Reply = struct { rpc: u32, value: w.Message };
+/// The broker owns one creator-bound kernel reference per retained ticket.
+/// Tests can exercise eviction/ACK ordering without importing platform tables.
+pub const Evidence = struct {
+    context: ?*const anyopaque = null,
+    retain: ?*const fn (?*const anyopaque, w.Identity) u64 = null,
+    release: ?*const fn (?*const anyopaque, w.Identity, u64) bool = null,
+};
 pub const Queue = struct {
+    evidence: Evidence = .{},
     broker: w.Identity = .{},
     slots: [history_capacity]Slot = .{Slot{}} ** history_capacity,
     waiters: [capacity]Waiter = .{Waiter{}} ** capacity,
@@ -27,12 +35,12 @@ pub const Queue = struct {
     }
     pub fn submit(self: *Queue, request: w.Message, desktop: w.Identity, now: u64) w.Message {
         if (!request.broker.eql(self.broker)) return self.rejected(request, .stale_service);
-        if (!request.request.valid() or request.phase != .request or request.code != .ok or request.flags & ~w.wait_frame != 0 or
+        if (!request.request.valid() or request.phase != .request or request.code != .ok or request.flags & ~w.request_flags != 0 or
             request.desktop.valid() or request.process.valid() or request.window != 0 or request.raw != 0 or request.content != 0 or w.text(&request.path).len == 0)
             return self.rejected(request, .invalid);
         if (self.lookup(request)) |old| {
             if (old.value.policy != request.policy or old.value.deadline != request.deadline or
-                (old.value.flags & w.wait_frame) != request.flags or !std.mem.eql(u8, &old.value.path, &request.path) or
+                (old.value.flags & w.request_flags) != request.flags or !std.mem.eql(u8, &old.value.path, &request.path) or
                 !std.mem.eql(u8, &old.value.args, &request.args) or !std.mem.eql(u8, &old.value.title, &request.title)) return self.rejected(request, .invalid);
             return old.value;
         }
@@ -52,6 +60,7 @@ pub const Queue = struct {
         }
         if (active >= capacity) return self.rejected(request, .queue_full);
         const s = free orelse oldest orelse return self.rejected(request, .queue_full);
+        if (s.used and !self.drop(s)) return self.rejected(request, .queue_full);
         self.sequence +|= 1;
         s.* = .{ .used = true, .value = request, .sequence = self.sequence };
         s.value.desktop = desktop;
@@ -81,6 +90,7 @@ pub const Queue = struct {
     pub fn complete(self: *Queue, value: w.Message, now: u64) bool {
         const s = self.lookup(value) orelse return false;
         if (!s.claimed or !s.value.desktop.eql(value.desktop) or !value.broker.eql(self.broker) or
+            (value.flags & w.request_flags) != (s.value.flags & w.request_flags) or
             @intFromEnum(value.phase) < @intFromEnum(s.value.phase) or value.phase == .request or value.phase == .accepted or
             (value.phase == .starting and value.code == .ok) or
             (@intFromEnum(value.phase) >= @intFromEnum(w.Phase.process) and !value.process.valid()) or
@@ -97,6 +107,12 @@ pub const Queue = struct {
         s.value.window = value.window;
         s.value.content = value.content;
         s.value.raw = value.raw;
+        // Desktop holds its temporary exact reference until this completion
+        // ACK. Acquire the broker's own binding before returning that ACK.
+        if (s.evidence == 0 and s.value.flags & w.retain_evidence != 0 and value.process.valid()) {
+            if (self.evidence.retain) |retain| s.evidence = retain(self.evidence.context, value.process);
+            if (s.evidence == 0) s.value.flags |= w.evidence_unavailable else s.value.flags &= ~w.evidence_unavailable;
+        }
         s.value.flags &= ~w.terminal;
         if (value.code != .ok or value.phase == .content or (value.phase == .window and s.value.flags & w.wait_frame == 0)) {
             s.value.flags |= w.terminal;
@@ -134,6 +150,14 @@ pub const Queue = struct {
         }
         return null;
     }
+    fn drop(self: *Queue, slot: *Slot) bool {
+        if (slot.evidence != 0) {
+            const release = self.evidence.release orelse return false;
+            if (!release(self.evidence.context, slot.value.process, slot.evidence)) return false;
+        }
+        slot.* = .{};
+        return true;
+    }
     pub fn maintain(self: *Queue, desktop: w.Identity, now: u64, retention: u64) void {
         for (&self.slots) |*s| {
             if (!s.used) continue;
@@ -144,7 +168,7 @@ pub const Queue = struct {
                 s.settled = true;
             }
             if (s.value.done()) {
-                if ((!s.claimed or s.settled) and now >= s.retired +| retention) s.used = false;
+                if ((!s.claimed or s.settled) and now >= s.retired +| retention) _ = self.drop(s);
                 continue;
             }
             const failure: w.Code = if (!s.value.desktop.eql(desktop)) .desktop_lost else if (now >= s.value.deadline) .timeout else .ok;
@@ -325,4 +349,77 @@ test "desktop replacement settles an expired claim without transferring it" {
     try std.testing.expect(!q.take(replacement, 103).request.valid());
     q.maintain(replacement, 163, 60);
     try std.testing.expectEqual(w.Code.unknown, q.status(first).code);
+}
+
+test "evidence survives helper exit and duplicate ACK; retirement waits for release" {
+    const Hooks = struct {
+        retained: u32 = 0,
+        released: u32 = 0,
+        fail_release: bool = true,
+        fn retain(raw: ?*const anyopaque, process: w.Identity) u64 {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            std.debug.assert(process.instance == 30 and process.generation == 31);
+            self.retained += 1;
+            return self.retained;
+        }
+        fn release(raw: ?*const anyopaque, process: w.Identity, id: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            std.debug.assert(process.instance == 30 and process.generation == 31 and id != 0);
+            if (self.fail_release) {
+                self.fail_release = false;
+                return false;
+            }
+            self.released += 1;
+            return true;
+        }
+    };
+    var hooks = Hooks{};
+    var queue = Queue{ .broker = .{ .instance = 1, .generation = 2 }, .evidence = .{ .context = &hooks, .retain = Hooks.retain, .release = Hooks.release } };
+    const desktop = w.Identity{ .instance = 10, .generation = 11 };
+    var request = w.Message{ .broker = queue.broker, .request = .{ .instance = 20, .generation = 21 }, .flags = w.retain_evidence, .deadline = 10000 };
+    try w.copy(&request.path, "C:\\TEST.R4X");
+    try std.testing.expect(queue.submit(request, desktop, 0).code == .ok);
+    var result = queue.take(desktop, 1);
+    result.phase = .window;
+    result.window = 1;
+    result.process = .{ .instance = 30, .generation = 31 };
+    try std.testing.expect(queue.complete(result, 2));
+    try std.testing.expect(queue.complete(result, 3));
+    try std.testing.expectEqual(@as(u32, 1), hooks.retained);
+    try std.testing.expect(queue.status(request).flags & w.evidence_unavailable == 0);
+    queue.maintain(desktop, 102, 100);
+    try std.testing.expect(queue.lookup(request) != null); // no false release ACK
+    queue.maintain(desktop, 103, 100);
+    try std.testing.expect(queue.lookup(request) == null);
+    try std.testing.expectEqual(@as(u32, 1), hooks.released);
+    try std.testing.expect(!queue.complete(result, 104));
+
+    // Explicit retention failure reports unavailable without changing the
+    // actual successful launch result or inventing a process exit code.
+    queue.evidence = .{};
+    request.request.generation += 1;
+    try std.testing.expect(queue.submit(request, desktop, 105).code == .ok);
+    result = queue.take(desktop, 106);
+    result.phase = .window;
+    result.window = 1;
+    result.process = .{ .instance = 30, .generation = 31 };
+    try std.testing.expect(queue.complete(result, 107));
+    const failed = queue.status(request);
+    try std.testing.expect(failed.code == .ok and failed.flags & w.evidence_unavailable != 0);
+    queue.evidence = .{ .context = &hooks, .retain = Hooks.retain, .release = Hooks.release };
+    // Admission beyond the bounded history evicts through the same real
+    // release acknowledgement; every successful reference is eventually freed.
+    for (0..history_capacity + 1) |i| {
+        request.request.generation += 1;
+        const now = 200 + i * 3;
+        try std.testing.expect(queue.submit(request, desktop, now).code == .ok);
+        result = queue.take(desktop, now + 1);
+        result.phase = .window;
+        result.window = 1;
+        result.process = .{ .instance = 30, .generation = 31 };
+        try std.testing.expect(queue.complete(result, now + 2));
+    }
+    try std.testing.expect(hooks.released > 1); // at least one bound record evicted
+    queue.maintain(desktop, 20000, 100);
+    try std.testing.expectEqual(hooks.retained, hooks.released);
 }

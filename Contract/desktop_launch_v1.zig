@@ -11,6 +11,10 @@ pub const size = 448;
 pub const magic: u32 = 0x314c4452; // RDL1
 pub const wait_frame: u32 = 1;
 pub const terminal: u32 = 2;
+// Opt-in evidence retention; fixed V1 field offsets and448-byte size stay intact.
+pub const retain_evidence: u32 = 4;
+pub const evidence_unavailable: u32 = 8;
+pub const request_flags: u32 = wait_frame | retain_evidence;
 pub const Phase = enum(u32) { request, accepted, starting, process, window, content };
 pub const Code = enum(u32) {
     ok,
@@ -124,7 +128,7 @@ pub fn decode(bytes: []const u8) !Message {
         .raw = get(bytes, 100, i32),
         .content = get(bytes, 104, u64),
     };
-    if (m.flags & ~@as(u32, 3) != 0 or m.policy > 2 or m.window > 4) return error.InvalidWire;
+    if (m.flags & ~@as(u32, 15) != 0 or m.policy > 2 or m.window > 4) return error.InvalidWire;
     @memcpy(&m.path, bytes[112..272]);
     @memcpy(&m.args, bytes[272..400]);
     @memcpy(&m.title, bytes[400..448]);
