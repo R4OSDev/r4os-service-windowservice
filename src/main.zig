@@ -338,7 +338,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
     const request = service_payload[0..payload_len];
     return switch (header.op) {
         graphics_markers.operation => replyGraphicsMarkers(ctx, handle, header, state, request),
-        launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete => replyLaunch(ctx, handle, header, state, request),
+        launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete, launch_wire.received => replyLaunch(ctx, handle, header, state, request),
         launch_wire.exchange => replyTrayDesktop(ctx, handle, header, state, request),
         desktop_check.operation => queueDesktopCheck(ctx, handle, header, state, request),
         desktop_check.tray_operation => replyTrayDesktop(ctx, handle, header, state, request),
@@ -717,8 +717,9 @@ fn replyLaunch(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Ser
             if (request.deadline > now +| ctx.ticksFromMilliseconds(300000)) break :blk state.launches.rejected(request, .invalid);
             break :blk state.launches.beginWait(request, header.request_id, now) orelse return 0;
         },
-        launch_wire.complete => {
-            const valid = desktopCaller(ctx, header.client_id, launchHandle(request.desktop), state) != null and state.launches.complete(request, now);
+        launch_wire.complete, launch_wire.received => {
+            const valid = desktopCaller(ctx, header.client_id, launchHandle(request.desktop), state) != null and
+                (if (header.op == launch_wire.received) state.launches.acknowledgeDelivery(request) else state.launches.complete(request, now));
             return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, if (valid) 0 else r4os.abi.service_api_result_invalid, "");
         },
         else => unreachable,

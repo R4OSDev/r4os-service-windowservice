@@ -7,6 +7,9 @@ pub const status: u16 = 4737;
 pub const wait: u16 = 4738;
 pub const exchange: u16 = 4739;
 pub const complete: u16 = 4740;
+// Desktop retained the exact execution receipt. This is no process/frame
+// result and cannot settle or retire a possibly still-running loader.
+pub const received: u16 = 4741;
 pub const size = 448;
 pub const magic: u32 = 0x314c4452; // RDL1
 pub const wait_frame: u32 = 1;

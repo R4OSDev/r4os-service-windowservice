@@ -4,7 +4,7 @@ const std = @import("std");
 const w = @import("desktop_launch");
 pub const capacity = 8;
 pub const history_capacity = 16;
-const Slot = struct { used: bool = false, claimed: bool = false, settled: bool = false, value: w.Message = .{}, sequence: u64 = 0, retired: u64 = 0, evidence: u64 = 0 };
+const Slot = struct { used: bool = false, claimed: bool = false, delivery_known: bool = false, settled: bool = false, value: w.Message = .{}, sequence: u64 = 0, retired: u64 = 0, evidence: u64 = 0 };
 const Waiter = struct { used: bool = false, key: w.Message = .{}, rpc: u32 = 0, deadline: u64 = 0 };
 pub const Reply = struct { rpc: u32, value: w.Message };
 /// The broker owns one creator-bound kernel reference per retained ticket.
@@ -71,11 +71,14 @@ pub const Queue = struct {
         var selected: ?*Slot = null;
         for (&self.slots) |*s| {
             if (!s.used or !s.value.desktop.eql(desktop)) continue;
-            // Redeliver the SAME ticket until completion. Desktop retains its
-            // execution receipt through lost transport replies and never respawns.
-            // Caller timeout does not acknowledge an asynchronous loader. Keep
-            // its mailbox and history until the Desktop returns the real result.
-            if (s.claimed and !s.settled) return s.value;
+            // A lost take reply still redelivers the exact ticket. Once Desktop
+            // confirms receipt ownership, its independent worker/first-frame
+            // result no longer prevents offering other unclaimed work. Receipt
+            // ownership never settles a worker or permits history eviction.
+            if (s.claimed) {
+                if (!s.settled and !s.delivery_known) return s.value;
+                continue;
+            }
             if (s.value.done()) continue;
             if (now >= s.value.deadline) continue;
             if (selected == null or s.sequence < selected.?.sequence) selected = s;
@@ -86,6 +89,14 @@ pub const Queue = struct {
             return s.value;
         }
         return .{ .broker = self.broker };
+    }
+    pub fn acknowledgeDelivery(self: *Queue, value: w.Message) bool {
+        const s = self.lookup(value) orelse return false;
+        if (!s.claimed or !value.broker.eql(self.broker) or !s.value.desktop.eql(value.desktop) or
+            value.phase != .starting or value.code != .ok or value.process.valid() or value.window != 0 or
+            value.raw != 0 or value.content != 0 or value.flags != (s.value.flags & w.request_flags)) return false;
+        s.delivery_known = true;
+        return true;
     }
     pub fn complete(self: *Queue, value: w.Message, now: u64) bool {
         const s = self.lookup(value) orelse return false;
@@ -101,6 +112,7 @@ pub const Queue = struct {
             return s.value.phase == value.phase and s.value.code == value.code and s.value.process.eql(value.process) and
                 s.value.window == value.window and s.value.content == value.content and s.value.raw == value.raw;
         }
+        s.delivery_known = true;
         s.value.phase = value.phase;
         s.value.code = value.code;
         s.value.process = value.process;
@@ -268,6 +280,119 @@ test "window receipt does not imply consumed content; wire bounds reject corrupt
     try std.testing.expect(decoded.sameKey(key));
     bytes[12] = 1;
     try std.testing.expectError(error.InvalidWire, w.decode(&bytes));
+}
+
+test "independent launch is offered while an acknowledged window waits for first content" {
+    var q = Queue{ .broker = sample(3).broker };
+    var first = sample(3);
+    first.flags = w.wait_frame;
+    const second = sample(4);
+    _ = q.submit(first, desk, 1);
+    _ = q.submit(second, desk, 1);
+    var window = q.take(desk, 2);
+    try std.testing.expect(window.sameKey(first));
+    window.phase = .window;
+    window.process = .{ .instance = 90, .generation = 99 };
+    window.window = 1;
+    try std.testing.expect(q.complete(window, 3));
+    try std.testing.expect(!q.status(first).done());
+    try std.testing.expectEqual(@as(u32, 4), q.take(desk, 4).request.instance);
+    try std.testing.expectEqual(w.Phase.window, q.status(first).phase);
+    try std.testing.expect(!q.status(first).done());
+}
+
+test "receipt ACK frees independent work but never fabricates a loader result" {
+    var q = Queue{ .broker = sample(3).broker };
+    var a = sample(3);
+    a.flags = w.wait_frame;
+    const b = sample(4);
+    _ = q.submit(a, desk, 1);
+    _ = q.submit(b, desk, 1);
+    const taken = q.take(desk, 2);
+    try std.testing.expect(taken.sameKey(a));
+    // Three lost take replies still offer precisely A, not another worker.
+    for (0..3) |_| try std.testing.expect(q.take(desk, 3).sameKey(a));
+    try std.testing.expect(q.acknowledgeDelivery(taken));
+    try std.testing.expect(q.acknowledgeDelivery(taken)); // Lost receipt ACK.
+    const state = q.status(a);
+    try std.testing.expectEqual(w.Phase.starting, state.phase);
+    try std.testing.expect(!state.process.valid() and state.window == 0 and state.content == 0);
+    try std.testing.expect(!state.done() and !q.lookup(a).?.settled);
+    try std.testing.expect(q.take(desk, 4).sameKey(b));
+    try std.testing.expect(q.acknowledgeDelivery(q.status(b)));
+    try std.testing.expect(!q.take(desk, 5).request.valid());
+    try std.testing.expectEqual(@as(u64, 100), q.status(a).deadline);
+}
+
+test "received timed-out loader stays owned until its exact late result" {
+    var q = Queue{ .broker = sample(3).broker };
+    const a = sample(3);
+    var b = sample(4);
+    b.deadline = 20000;
+    _ = q.submit(a, desk, 1);
+    _ = q.submit(b, desk, 1);
+    var work = q.take(desk, 2);
+    try std.testing.expect(q.acknowledgeDelivery(work));
+    q.maintain(desk, 101, 60);
+    try std.testing.expectEqual(w.Code.timeout, q.status(a).code);
+    try std.testing.expect(q.acknowledgeDelivery(work)); // Not a worker finish.
+    q.maintain(desk, 10000, 60);
+    try std.testing.expect(q.lookup(a) != null and !q.lookup(a).?.settled);
+    try std.testing.expect(q.take(desk, 10001).sameKey(b));
+    work.phase = .process;
+    work.process = .{ .instance = 90, .generation = 99 };
+    work.code = .timeout;
+    try std.testing.expect(q.complete(work, 10002));
+    try std.testing.expect(q.lookup(a).?.settled);
+    try std.testing.expect(q.status(a).process.eql(work.process));
+    try std.testing.expect(!q.status(b).done());
+    q.maintain(desk, 10063, 60);
+    try std.testing.expect(q.lookup(a) == null);
+    try std.testing.expect(q.lookup(b) != null);
+}
+
+test "receipt ownership alone cannot permit history eviction under pressure" {
+    var q = Queue{ .broker = sample(3).broker };
+    const a = sample(3);
+    _ = q.submit(a, desk, 1);
+    const work = q.take(desk, 2);
+    try std.testing.expect(q.acknowledgeDelivery(work));
+    q.maintain(desk, 101, 60000);
+    for (0..history_capacity * 2) |i| {
+        const now: u64 = 102 + i * 3;
+        var other = sample(@intCast(4 + i));
+        other.deadline = now + 1;
+        try std.testing.expectEqual(w.Code.ok, q.submit(other, desk, now).code);
+        q.maintain(desk, now + 2, 60000);
+    }
+    try std.testing.expect(q.lookup(a) != null and !q.lookup(a).?.settled);
+    try std.testing.expect(q.lookup(a).?.value.sameKey(work));
+    try std.testing.expect(!q.take(desk, 20000).request.valid());
+}
+
+test "foreign receipt ACK cannot release the current unacknowledged delivery" {
+    var q = Queue{ .broker = sample(3).broker };
+    const a = sample(3);
+    _ = q.submit(a, desk, 1);
+    _ = q.submit(sample(4), desk, 1);
+    const work = q.take(desk, 2);
+    var foreign = work;
+    foreign.desktop.generation += 1;
+    try std.testing.expect(!q.acknowledgeDelivery(foreign));
+    foreign = work;
+    foreign.request.generation += 1;
+    try std.testing.expect(!q.acknowledgeDelivery(foreign));
+    foreign = work;
+    foreign.broker.generation += 1;
+    try std.testing.expect(!q.acknowledgeDelivery(foreign));
+    foreign = work;
+    foreign.process = .{ .instance = 90, .generation = 99 };
+    try std.testing.expect(!q.acknowledgeDelivery(foreign));
+    foreign = work;
+    foreign.flags |= w.terminal;
+    try std.testing.expect(!q.acknowledgeDelivery(foreign));
+    try std.testing.expect(q.take(desk, 3).sameKey(work));
+    try std.testing.expect(!q.lookup(a).?.delivery_known);
 }
 
 test "late attachment never satisfies WAITFRAME after expiration" {
