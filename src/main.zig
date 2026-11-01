@@ -4,12 +4,14 @@ const tray_broker = @import("tray_broker.zig");
 const desktop_check = @import("desktop_check");
 const desktop_checks = @import("desktop_checks.zig");
 const window_mode = @import("window_mode.zig");
+const window_actions = @import("window_actions.zig");
 const display_broker = @import("display_broker.zig");
 const graphics_broker = @import("graphics_broker.zig");
 const graphics_markers = @import("desktop_graphics");
 const graphics_platform = @import("graphics_platform.zig");
 const launch_wire = @import("desktop_launch");
 const desktop_launch = @import("desktop_launch.zig");
+const desktop_evidence = @import("desktop_evidence.zig");
 const desktop_diagnostics = @import("desktop_diagnostics");
 
 const service_name = "WINSVC";
@@ -216,12 +218,14 @@ const ServiceState = struct {
     tray: tray_broker.Broker = .{},
     desktop_checks: desktop_checks.Queue = .{},
     launches: desktop_launch.Queue = .{},
+    evidence: desktop_evidence.Broker = .{},
     display: display_broker.Broker = .{},
     graphics: graphics_broker.Broker = .{},
     graphics_platform: graphics_platform.Platform = .{},
     desktop: ?r4os.r4desk.Context = null,
     graphics_notified: u64 = 1,
     modes: window_mode.Broker = .{},
+    actions: window_actions.Broker = .{},
     modes_notified: u64 = 1,
     next_tray_owner_sweep_tick: ?u64 = null,
 };
@@ -250,6 +254,56 @@ fn releaseLaunchEvidence(opaque_context: ?*const anyopaque, identity: launch_wir
     const observation = r4os.abi.ProgramObservationHandle{ .process = launchHandle(identity), .id = id };
     const result = ctx.programObservationRelease(&observation);
     return result == 0 or result == r4os.abi.program_handle_error_not_found;
+}
+
+fn retainEvidence(context: ?*const anyopaque, process: r4os.abi.ProgramProcessHandle) u64 {
+    return retainLaunchEvidence(context, launchIdentity(process));
+}
+fn releaseEvidence(context: ?*const anyopaque, process: r4os.abi.ProgramProcessHandle, id: u64) bool {
+    return releaseLaunchEvidence(context, launchIdentity(process), id);
+}
+fn queryEvidence(context: ?*const anyopaque, process: r4os.abi.ProgramProcessHandle, id: u64, out: *r4os.abi.ProgramProcessCompletion) i32 {
+    const ctx: *const r4os.r4sys.Context = @ptrCast(@alignCast(context orelse return r4os.abi.program_handle_error_invalid));
+    const observation: r4os.abi.ProgramObservationHandle = .{ .process = process, .id = id };
+    return ctx.programObservationWait(&observation, 0, out);
+}
+fn readEvidence(context: ?*const anyopaque, process: r4os.abi.ProgramProcessHandle, id: u64, offset: u32, out: []u8, count: *u32) i32 {
+    const ctx: *const r4os.r4sys.Context = @ptrCast(@alignCast(context orelse return r4os.abi.program_handle_error_invalid));
+    const observation: r4os.abi.ProgramObservationHandle = .{ .process = process, .id = id };
+    return ctx.programObservationRead(&observation, offset, out, count);
+}
+fn evidenceSource(state: *ServiceState, token: r4os.abi.DesktopEvidenceToken) ?desktop_evidence.Source {
+    const key: launch_wire.Message = .{ .broker = launchIdentity(token.broker), .request = launchIdentity(token.request) };
+    const slot = state.launches.lookup(key) orelse return null;
+    return .{
+        .request = launchHandle(slot.value.request),
+        .process = launchHandle(slot.value.process),
+        .desktop = launchHandle(slot.value.desktop),
+        .protected = slot.evidence != 0,
+        .terminal = slot.value.done(),
+    };
+}
+fn replyEvidence(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const a = r4os.abi;
+    if (payload.len != @sizeOf(a.DesktopEvidenceRequest)) return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_invalid, "");
+    var request: a.DesktopEvidenceRequest = .{};
+    @memcpy(std.mem.asBytes(&request), payload);
+    if ((header.op != a.desktop_evidence_op_read and (request.offset != 0 or request.capacity != 0)) or
+        request.capacity > a.desktop_evidence_max_output_chunk or
+        (header.op == a.desktop_evidence_op_read and request.capacity == 0)) return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_invalid, "");
+    const now = ctx.ticks();
+    const value: a.DesktopEvidenceReply = switch (header.op) {
+        a.desktop_evidence_op_scope => if (std.meta.eql(request.token, a.DesktopEvidenceToken{})) state.evidence.scope() else .{ .token = request.token, .result = a.desktop_evidence_result_invalid },
+        a.desktop_evidence_op_reserve => state.evidence.reserve(request.token, now, now +| ctx.ticksFromMilliseconds(a.desktop_evidence_reservation_ms)),
+        a.desktop_evidence_op_offer => state.evidence.offer(request.token, evidenceSource(state, request.token), now),
+        a.desktop_evidence_op_ack => state.evidence.acknowledge(request.token, now),
+        a.desktop_evidence_op_status => state.evidence.status(request.token, now),
+        a.desktop_evidence_op_read => state.evidence.read(request.token, request.offset, service_response[@sizeOf(a.DesktopEvidenceReply)..][0..request.capacity], now),
+        a.desktop_evidence_op_release => state.evidence.release(request.token, now),
+        else => unreachable,
+    };
+    @memcpy(service_response[0..@sizeOf(a.DesktopEvidenceReply)], std.mem.asBytes(&value));
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, service_response[0 .. @sizeOf(a.DesktopEvidenceReply) + value.data_bytes]);
 }
 
 fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, desktop: ?r4os.r4desk.Context) i32 {
@@ -283,7 +337,13 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     state.desktop_checks.broker = checkIdentity(state.graphics.service);
     state.launches.broker = launchIdentity(state.graphics.service);
     state.launches.evidence = .{ .context = ctx, .retain = retainLaunchEvidence, .release = releaseLaunchEvidence };
+    state.evidence.service = state.graphics.service;
+    if (!r4os.secure_random.fill(std.mem.asBytes(&state.evidence.epoch))) state.evidence.epoch = .{0} ** 3;
+    state.evidence.backend = .{ .context = ctx, .retain = retainEvidence, .release = releaseEvidence, .query = queryEvidence, .read = readEvidence };
+    defer state.evidence.clear();
     state.modes.service = state.graphics.service;
+    state.actions.service = state.graphics.service;
+    state.actions.epoch = state.evidence.epoch;
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(ctx.*, handle, .{});
     while (true) {
@@ -337,6 +397,9 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
     const payload_len: usize = @intCast(got);
     const request = service_payload[0..payload_len];
     return switch (header.op) {
+        r4os.abi.desktop_action_op_scope, r4os.abi.desktop_action_op_grant, r4os.abi.desktop_action_op_command, r4os.abi.desktop_action_op_status, r4os.abi.desktop_action_op_release, r4os.abi.desktop_action_op_app_view, r4os.abi.desktop_action_op_app_frame => replyWindowAction(ctx, handle, header, state, request),
+        r4os.abi.desktop_action_op_exchange => replyDesktopWindow(ctx, handle, header, state, request),
+        r4os.abi.desktop_evidence_op_scope, r4os.abi.desktop_evidence_op_reserve, r4os.abi.desktop_evidence_op_offer, r4os.abi.desktop_evidence_op_ack, r4os.abi.desktop_evidence_op_status, r4os.abi.desktop_evidence_op_read, r4os.abi.desktop_evidence_op_release => replyEvidence(ctx, handle, header, state, request),
         graphics_markers.operation => replyGraphicsMarkers(ctx, handle, header, state, request),
         launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete, launch_wire.received => replyLaunch(ctx, handle, header, state, request),
         launch_wire.exchange => replyTrayDesktop(ctx, handle, header, state, request),
@@ -397,6 +460,8 @@ fn nextServiceDeadline(state: *const ServiceState) ?u64 {
     if (state.tray.nextDeadline()) |value| deadline = @min(deadline orelse value, value);
     if (state.graphics.nextDeadline()) |value| deadline = @min(deadline orelse value, value);
     if (state.launches.deadline()) |value| deadline = @min(deadline orelse value, value);
+    if (state.evidence.nextDeadline()) |value| deadline = @min(deadline orelse value, value);
+    if (state.actions.deadline()) |value| deadline = @min(deadline orelse value, value);
     if (state.desktop_checks.pending) |job| deadline = @min(deadline orelse job.deadline, job.deadline);
     return deadline;
 }
@@ -479,6 +544,8 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
         refreshOwnerSweep(state, now);
     }
 
+    state.evidence.maintain(now, ctx.ticksFromMilliseconds(200));
+    state.actions.expire(now);
     state.launches.maintain(launchIdentity(state.tray.desktop_owner), now, ctx.ticksFromMilliseconds(60000));
     while (state.launches.takeReply(now)) |reply| _ = replyLaunchValue(ctx, handle, reply.rpc, reply.value);
 
@@ -720,6 +787,12 @@ fn replyLaunch(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Ser
         launch_wire.complete, launch_wire.received => {
             const valid = desktopCaller(ctx, header.client_id, launchHandle(request.desktop), state) != null and
                 (if (header.op == launch_wire.received) state.launches.acknowledgeDelivery(request) else state.launches.complete(request, now));
+            // The launch queue already retained before its ACK. Promote each
+            // previously offered receiver while that exact bridge still exists.
+            if (valid and header.op == launch_wire.complete) if (evidenceSource(state, .{ .broker = launchHandle(request.broker), .request = launchHandle(request.request) })) |source| {
+                state.evidence.completed(source, now);
+                if (actionLaunch(state, source.request)) |launch| state.actions.launched(launch);
+            };
             return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, if (valid) 0 else r4os.abi.service_api_result_invalid, "");
         },
         else => unreachable,
@@ -793,6 +866,94 @@ fn decodeFixed(comptime T: type, payload: []const u8) ?T {
     var value: T = undefined;
     @memcpy(std.mem.asBytes(&value), payload);
     return value;
+}
+
+fn actionLaunch(state: *ServiceState, requester: r4os.abi.ProgramProcessHandle) ?window_actions.Launch {
+    const key: launch_wire.Message = .{ .broker = launchIdentity(state.actions.service), .request = launchIdentity(requester) };
+    const slot = state.launches.lookup(key) orelse return null;
+    return .{ .request = launchHandle(slot.value.request), .owner = launchHandle(slot.value.process), .desktop = launchHandle(slot.value.desktop), .window_id = window_actions.windowIdFromLaunchReceipt(slot.value.window), .deadline = slot.value.deadline };
+}
+fn actionReply(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, response: r4os.abi.DesktopActionReply) i32 {
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&response));
+}
+fn replyWindowAction(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const a = r4os.abi;
+    const request = decodeFixed(a.DesktopActionRequest, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_invalid, "ACTIONBAD");
+    const now = ctx.ticks();
+    var caller: a.ProgramProcessHandle = .{};
+    if (ctx.programOpenHandle(header.client_id, &caller) != 0 or liveCaller(ctx, header.client_id, caller) == null)
+        return actionReply(ctx, handle, header, .{ .request = request, .result = a.desktop_action_result_not_owner });
+    var tail = request;
+    tail.token = .{};
+    if (header.op == a.desktop_action_op_status) tail.operation = 0;
+    if (header.op != a.desktop_action_op_command and header.op != a.desktop_action_op_app_frame and !std.meta.eql(tail, a.DesktopActionRequest{}))
+        return actionReply(ctx, handle, header, .{ .request = request, .result = a.desktop_action_result_invalid });
+    const before = state.actions.revision;
+    const response: a.DesktopActionReply = switch (header.op) {
+        a.desktop_action_op_scope => if (std.meta.eql(request.token, a.DesktopActionToken{})) state.actions.scope() else .{ .request = request, .result = a.desktop_action_result_invalid },
+        a.desktop_action_op_grant => block: {
+            // Allocation is rare. Reclaim only positively retired controller
+            // generations using the existing canonical owner query; no timer.
+            for (&state.actions.slots) |slot| if (slot.used and processHandleGone(ctx, slot.token.controller)) state.actions.retireController(slot.token.controller);
+            break :block state.actions.grant(request.token, caller, actionLaunch(state, request.token.request), liveCaller(ctx, request.token.controller.instance_id, request.token.controller) != null);
+        },
+        a.desktop_action_op_command => if (request.token.window.serial == 0) state.actions.command(request, caller, now, true) else if (request.deadline > now and request.deadline - now > ctx.ticksFromMilliseconds(a.desktop_action_max_timeout_ms))
+            .{ .request = request, .result = a.desktop_action_result_invalid }
+        else if (!processHandleGone(ctx, request.token.window.owner) and liveCaller(ctx, request.token.window.owner.instance_id, request.token.window.owner) == null)
+            .{ .request = request, .result = a.desktop_action_result_unavailable }
+        else
+            state.actions.command(request, caller, now, !processHandleGone(ctx, request.token.window.owner)),
+        a.desktop_action_op_status => state.actions.status(request.token, request.operation, now),
+        a.desktop_action_op_release => state.actions.release(request.token, caller, now),
+        a.desktop_action_op_app_view => if (window_actions.same(request.token.window.owner, .{}) or window_actions.same(request.token.window.owner, caller)) state.actions.appView(caller, request.token.window.window_id) else .{ .request = request, .result = a.desktop_action_result_not_owner },
+        a.desktop_action_op_app_frame => state.actions.appFrame(request, caller),
+        else => unreachable,
+    };
+    if (before != state.actions.revision) {
+        if (state.desktop) |desk| _ = desk.desktopActivityNotify();
+    }
+    return actionReply(ctx, handle, header, response);
+}
+fn replyDesktopWindow(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const a = r4os.abi;
+    var response: a.DesktopWindowReply = .{ .mode = .{ .result = window_mode.invalid }, .action = .{ .result = a.desktop_action_result_invalid } };
+    if (decodeFixed(a.DesktopWindowExchange, payload)) |incoming| {
+        var request = incoming;
+        const owner = request.mode.identity;
+        if (desktopCaller(ctx, header.client_id, owner.desktop, state) == null) {
+            response.mode.result = window_mode.not_owner;
+        } else if (request.mode.flags == 0 and liveCaller(ctx, owner.owner.instance_id, owner.owner) == null) {
+            response.mode.result = window_mode.unavailable;
+        } else {
+            response.mode = state.modes.exchange(&request.mode);
+            if (response.mode.result == 0) {
+                if (request.mode.flags == 1) {
+                    // Preserve an original result which raced with target end;
+                    // the separately retained apply snapshot is not a new view.
+                    if (request.flags == 1 and window_actions.same(request.ack.token.window.desktop, owner.desktop) and
+                        window_actions.same(request.applied.window.desktop, owner.desktop))
+                        response.action = state.actions.exchange(request, ctx.ticks());
+                    state.actions.removeWindow(owner);
+                    if (request.flags == 0) response.action = .{ .result = a.desktop_action_result_target_ended };
+                } else if (window_actions.same(request.state.window.owner, response.mode.identity.owner) and
+                    window_actions.same(request.state.window.desktop, response.mode.identity.desktop) and
+                    request.state.window.window_id == response.mode.identity.window_id and
+                    (request.state.window.serial == 0 or window_actions.sameWindow(request.state.window, response.mode.identity)))
+                {
+                    // The mode broker assigns the canonical serial on first
+                    // real Desktop publication. Never substitute another owner.
+                    request.state.window = response.mode.identity;
+                    response.action = if (request.flags == 1 and (!window_actions.same(request.ack.token.window.desktop, owner.desktop) or
+                        !window_actions.same(request.applied.window.desktop, owner.desktop)))
+                        .{ .request = request.ack, .result = a.desktop_action_result_not_owner }
+                    else
+                        state.actions.exchange(request, ctx.ticks());
+                }
+            }
+        }
+    }
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_ok, std.mem.asBytes(&response));
 }
 
 fn replyWindowMode(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {

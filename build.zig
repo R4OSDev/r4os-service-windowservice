@@ -40,8 +40,19 @@ pub fn build(b: *std.Build) void {
     const launch_root = b.createModule(.{ .root_source_file = b.path("src/desktop_launch.zig"), .target = b.graph.host });
     launch_root.addImport("desktop_launch", launch_wire);
     const launch_tests = b.addRunArtifact(b.addTest(.{ .root_module = launch_root }));
-    b.step("launch-test", "Product launch ownership, deadlines, generations and copied wire").dependOn(&launch_tests.step);
+    const launch_step = b.step("launch-test", "Product launch ownership, deadlines, generations and copied wire");
+    launch_step.dependOn(&launch_tests.step);
     test_step.dependOn(&launch_tests.step);
+    const evidence_root = b.createModule(.{ .root_source_file = b.path("src/desktop_evidence.zig"), .target = b.graph.host });
+    evidence_root.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const evidence_tests = b.addRunArtifact(b.addTest(.{ .root_module = evidence_root }));
+    launch_step.dependOn(&evidence_tests.step);
+    test_step.dependOn(&evidence_tests.step);
+    const actions_root = b.createModule(.{ .root_source_file = b.path("src/window_actions.zig"), .target = b.graph.host });
+    actions_root.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const actions_tests = b.addRunArtifact(b.addTest(.{ .root_module = actions_root }));
+    launch_step.dependOn(&actions_tests.step);
+    test_step.dependOn(&actions_tests.step);
 
     // Exercise the actual service maintenance adapter and its real brokers.
     const maintenance_root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host });

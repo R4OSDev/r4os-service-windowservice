@@ -1,4 +1,4 @@
-﻿# WINSVC.R4X
+# WINSVC.R4X
 
 `WINSVC.R4X` is an independent R4OS service implemented in Zig.
 
@@ -86,3 +86,55 @@ job still expires after at most two seconds. Desktop keeps the ordinary
 CHECK limit at60 seconds and enforces the purpose of its exact reservation.
 Prepared SNES geometry is bound through the same existing own-GUI operation;
 the service never creates a child or transports a foreign process pointer.
+
+## Restartable Desktop evidence handoff (0.88.97)
+
+WINSVC29 owns a bounded16slot evidence broker over Contract67 service messages
+4784..4790. It retains only while the existing early launch reference protects
+the same process. Reserve has no kernel reference; Offer creates a separate
+creator-bound WINSVC observation. Waiting offers promote before Desktop ACK.
+ACK makes the saved canonical token durable until Release or service end;
+unacknowledged reservations/offers expire after300000ms. Status never creates
+references or applications. Lost launch history remains Unknown/Unavailable.
+
+The192bit incarnation comes from the existing SDK actual-entropy provider.
+R4DEV is a required manifest import for its hardware source. Missing entropy
+makes Scope unavailable without blocking ordinary legacy launches. Raw kernel
+binding IDs are never exported; external observers acquire no reap rights.
+The original Completion128 and output flags are copied without normalization.
+
+Normal Kernel452/SMP4/Desktop197/DESKRUN3 and source SDK126/Contract67 qualify
+C/Rust/Zig consumers, saved-token recovery, two independent references,
+17launch history pressure, real expiry and actual last-record/orphan cleanup.
+A fresh boot repeats all numeric identities; only the service epoch differs
+and rejects the old token. See Docs/Desktop/DeskRun.txt in workspace Docs.
+Existing launch-test includes four focused broker cases and14launch cases;
+no new periodic probe or workspace test gate is introduced. Source qualification
+does not publish SDK/Full packages or qualify an external Studio application.
+
+## Delegated WM actions (0.88.98)
+
+WINSVC31 uses Contract68 fixed service messages4800..4807. Six records:
+Token144, State168, Request192, Reply544, DesktopExchange640, CombinedReply640.
+Sixteen copied grants bind the original launch requester, named live full
+controller, exact child/window/Desktop/service and fresh192-bit epoch.
+The original caller grants; only the named controller mutates. Read-only
+status never creates an action. Unbound admission uses the original launch
+deadline. The legacy launch receipt is slot+1; `windowIdFromLaunchReceipt`
+maps1..4 to native GUI0..3 and zero to unavailable. Direct copying caused
+the preserved first native failure; the existing owner case now covers it.
+
+The real Desktop applies WM policy and retains one immutable original ACK.
+Late offered timeouts stay Unknown until reconciled; no blind replacement
+action. The applied snapshot/tick and separately current view remain distinct.
+App paint ACKs are only candidates. Desktop CPU composition or the exact GPU
+captured-frame completion provides visual proof; minimize proves invisibility
+without inventing an app frame. The640-byte envelope replaces the existing
+mode RPC one-for-one. No kernel ABI slot or additional permanent poll.
+
+Existing launch-test/test contain14launch +4evidence +4action owner cases.
+Normal452/SMP4/Desktop198/DESKRUN4 and sourceSDK127/Contract68/Lib40 qualify
+all actions, clamp, saved-token C/Rust/Zig, QMP actual pixels/physical input,
+normal close and separate actual GUI-slot reuse. Private trace copies are
+diagnostic-only; clean native artifacts contain none of that instrumentation.
+Full contracts/evidence: workspace Docs/Desktop/DeskRun.txt.
