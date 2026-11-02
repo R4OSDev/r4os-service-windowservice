@@ -28,7 +28,6 @@ const Slot = struct {
     admitted_tick: u64 = 0,
     applied_tick: u64 = 0,
     pointer_basis: u64 = 0,
-    pointer_view: u64 = 0,
     pointer_until: u64 = 0,
     pointer_down: bool = false,
     pointer_steps: u32 = 0,
@@ -173,7 +172,6 @@ pub const Broker = struct {
             self.serial += 1;
             s.* = .{ .used = true, .token = token, .launch = launch,
                 .pointer_basis = pointer_input,
-                .pointer_view = if (pointer_state) |state| state.view_revision else 0,
                 .pointer_until = if (pointer_state != null) now +| duration else 0 };
             s.token.grant = self.serial;
             self.bindKnown(s);
@@ -298,7 +296,7 @@ pub const Broker = struct {
             const state = self.current(t.window);
             const focus = self.focus[t.window.window_id];
             if (s.pointer_until == 0 or now >= s.pointer_until or request.deadline > s.pointer_until or
-                state.view_revision != s.pointer_view or state.window.serial == 0 or
+                state.window.serial == 0 or
                 !sameWindow(focus.window, state.window) or focus.view_revision != state.view_revision or
                 focus.input_revision != s.pointer_basis or focus.focus_state != a.desktop_focus_state_focused or
                 now < focus.observed_tick or now - focus.observed_tick > (s.pointer_until -| s.admitted_tick) / 2)

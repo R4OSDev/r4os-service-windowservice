@@ -182,7 +182,7 @@ test "focus snapshot is own-only, exact-incarnation and read-only" {
 
 test "pointer grant bounds one outside drag and retains each original receipt" {
     var b = broker();
-    const view = state(&b, 1);
+    var view = state(&b, 1);
     var token = b.scope().request.token;
     token.request = handle(4);
     token.controller = handle(5);
@@ -206,6 +206,16 @@ test "pointer grant bounds one outside drag and retains each original receipt" {
     move.kind = a.desktop_action_kind_pointer_move;
     move.x = 10;
     move.y = 90;
+    // A real Down can republish a view without changing authoritative input.
+    // Keep the gesture bound to input/window identity, not cosmetic revisions.
+    view = state(&b, 2);
+    try t.expect(b.publish(view));
+    try t.expect(b.publishFocus(.{ .window = view.window, .view_revision = 2,
+        .input_revision = 9, .observed_tick = 15, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    var invalidated = b;
+    try t.expect(invalidated.publishFocus(.{ .window = view.window, .view_revision = 2,
+        .input_revision = 10, .observed_tick = 16, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    try t.expectEqual(a.desktop_action_result_stale, invalidated.command(move, handle(5), 16, true).result);
     try t.expectEqual(a.desktop_action_phase_pending, b.command(move, handle(5), 16, true).phase);
     try t.expectEqual(a.desktop_action_phase_pending, b.exchange(.{ .state = view }, 17).phase);
     try t.expectEqual(a.desktop_action_phase_applied, b.exchange(.{ .state = view, .ack = move, .applied = view, .applied_tick = 18, .flags = 1 }, 19).phase);
