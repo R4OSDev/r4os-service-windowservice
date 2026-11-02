@@ -48,6 +48,11 @@ pub fn build(b: *std.Build) void {
     const evidence_tests = b.addRunArtifact(b.addTest(.{ .root_module = evidence_root }));
     launch_step.dependOn(&evidence_tests.step);
     test_step.dependOn(&evidence_tests.step);
+    const links_root = b.createModule(.{ .root_source_file = b.path("src/desktop_links.zig"), .target = b.graph.host });
+    links_root.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const links_tests = b.addRunArtifact(b.addTest(.{ .root_module = links_root }));
+    launch_step.dependOn(&links_tests.step);
+    test_step.dependOn(&links_tests.step);
     const actions_root = b.createModule(.{ .root_source_file = b.path("src/window_actions.zig"), .target = b.graph.host });
     actions_root.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
     const actions_tests = b.addRunArtifact(b.addTest(.{ .root_module = actions_root }));
