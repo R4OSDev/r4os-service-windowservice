@@ -74,7 +74,7 @@ pub const Broker = struct {
         if (self.serial == std.math.maxInt(u64)) return reject(q, a.desktop_link_result_quota);
         var free: ?usize = null;
         for (&self.slots, 0..) |*s, i| {
-            if (s.used and s.value.phase == a.desktop_link_phase_prepared and now >= s.value.request.deadline) s.value.phase = a.desktop_link_phase_expired;
+            if (s.used and (s.value.phase == a.desktop_link_phase_prepared or s.value.phase == a.desktop_link_phase_accepted) and now >= s.value.request.deadline) s.value.phase = a.desktop_link_phase_expired;
             if (!s.used or (s.binding == 0 and (s.value.phase == a.desktop_link_phase_cleaned or s.value.phase == a.desktop_link_phase_expired or s.value.phase == a.desktop_link_phase_rejected))) {
                 free = i;
                 break;
@@ -162,7 +162,7 @@ pub const Broker = struct {
         const s = &self.slots[i];
         if (!identical(q, s.value.request)) return reject(q, a.desktop_link_result_changed);
         var out = s.value;
-        if (out.phase == a.desktop_link_phase_prepared and now >= out.request.deadline) {
+        if ((out.phase == a.desktop_link_phase_prepared or out.phase == a.desktop_link_phase_accepted) and now >= out.request.deadline) {
             out.phase = a.desktop_link_phase_expired;
             out.result = a.desktop_link_result_expired;
         }
@@ -304,4 +304,16 @@ test "link binding original deadline and service epoch reject stale and replaced
     try std.testing.expectEqual(a.desktop_link_result_unknown, b.activate(saved, testHandle(3), testHandle(2), 103).result);
     b.epoch[0] += 1;
     try std.testing.expectEqual(a.desktop_link_result_stale, b.activate(replacement.request, testHandle(3), testHandle(2), 104).result);
+}
+
+test "accepted link with no Desktop offer expires without manufacturing a start" {
+    var b: Broker = .{ .service = testHandle(1), .epoch = .{ 4, 5, 6 } };
+    const intent = testRequest(&b);
+    const saved = b.prepare(intent, testHandle(3), 1, 200).request;
+    _ = b.activate(saved, testHandle(3), testHandle(2), 2);
+    const expired = b.status(saved, 101);
+    try std.testing.expectEqual(a.desktop_link_phase_expired, expired.phase);
+    try std.testing.expectEqual(@as(u32, 0), expired.process.instance_id);
+    try std.testing.expectEqual(@as(u64, 0), b.take(testHandle(2), 102).request.token.serial);
+    try std.testing.expectEqual(a.desktop_link_phase_expired, b.activate(saved, testHandle(3), testHandle(2), 103).phase);
 }

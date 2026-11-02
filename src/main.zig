@@ -221,6 +221,7 @@ const ServiceState = struct {
     launches: desktop_launch.Queue = .{},
     evidence: desktop_evidence.Broker = .{},
     links: desktop_links.Broker = .{},
+    link_desktop: r4os.abi.ProgramProcessHandle = .{},
     display: display_broker.Broker = .{},
     graphics: graphics_broker.Broker = .{},
     graphics_platform: graphics_platform.Platform = .{},
@@ -716,6 +717,7 @@ fn replyTrayDesktop(
     };
     const bytes: [*]const u8 = @ptrCast(&response);
     if (header.op == r4os.abi.desktop_link_op_exchange) {
+        if (caller != null and response.result == 0) state.link_desktop = request.desktop_owner;
         const tray_size = @sizeOf(r4os.abi.TrayDesktopExchange);
         var bridge: [tray_size + desktop_check.work_size + launch_wire.size + @sizeOf(r4os.abi.DesktopLinkReply)]u8 = undefined;
         @memcpy(bridge[0..tray_size], bytes[0..tray_size]);
@@ -1702,13 +1704,22 @@ fn replyLink(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Servi
     _ = ctx.programOpenHandle(header.client_id, &caller);
     const now = ctx.ticks();
     const response: a.DesktopLinkReply = switch (header.op) {
-        a.desktop_link_op_scope => if (std.meta.eql(request, a.DesktopLinkRequest{})) state.links.scope() else .{ .result = a.desktop_link_result_invalid },
+        a.desktop_link_op_scope => block: {
+            if (!std.meta.eql(request, a.DesktopLinkRequest{})) break :block .{ .result = a.desktop_link_result_invalid };
+            var scope = state.links.scope();
+            const owner = state.tray.desktop_owner;
+            if (!std.meta.eql(owner, state.link_desktop) or desktopCaller(ctx, owner.instance_id, owner, state) == null) {
+                scope.flags = 0;
+                scope.result = a.desktop_link_result_unavailable;
+            } else scope.desktop = owner;
+            break :block scope;
+        },
         a.desktop_link_op_prepare => state.links.prepare(request, caller, now, ctx.ticksFromMilliseconds(a.desktop_link_max_duration_ms)),
         a.desktop_link_op_status => state.links.status(request, now),
         a.desktop_link_op_release => state.links.release(request, now),
         a.desktop_link_op_activate => block: {
             const owner = state.tray.desktop_owner;
-            const desktop = if (desktopCaller(ctx, owner.instance_id, owner, state) != null) owner else a.ProgramProcessHandle{};
+            const desktop = if (std.meta.eql(owner, state.link_desktop) and desktopCaller(ctx, owner.instance_id, owner, state) != null) owner else a.ProgramProcessHandle{};
             const accepted = state.links.activate(request, caller, desktop, now);
             if (accepted.result == 0 and accepted.phase == a.desktop_link_phase_accepted) if (state.desktop) |desk| {
                 _ = desk.desktopActivityNotify();
