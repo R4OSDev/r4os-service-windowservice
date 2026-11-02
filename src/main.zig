@@ -398,7 +398,8 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
     const request = service_payload[0..payload_len];
     return switch (header.op) {
         r4os.abi.desktop_action_op_scope, r4os.abi.desktop_action_op_grant, r4os.abi.desktop_action_op_command, r4os.abi.desktop_action_op_status, r4os.abi.desktop_action_op_release, r4os.abi.desktop_action_op_app_view, r4os.abi.desktop_action_op_app_frame => replyWindowAction(ctx, handle, header, state, request),
-        r4os.abi.desktop_action_op_exchange => replyDesktopWindow(ctx, handle, header, state, request),
+        r4os.abi.desktop_action_op_exchange, r4os.abi.desktop_action_op_exchange_focus => replyDesktopWindow(ctx, handle, header, state, request),
+        r4os.abi.desktop_action_op_focus_snapshot => replyFocusSnapshot(ctx, handle, header, state, request),
         r4os.abi.desktop_evidence_op_scope, r4os.abi.desktop_evidence_op_reserve, r4os.abi.desktop_evidence_op_offer, r4os.abi.desktop_evidence_op_ack, r4os.abi.desktop_evidence_op_status, r4os.abi.desktop_evidence_op_read, r4os.abi.desktop_evidence_op_release => replyEvidence(ctx, handle, header, state, request),
         graphics_markers.operation => replyGraphicsMarkers(ctx, handle, header, state, request),
         launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete, launch_wire.received => replyLaunch(ctx, handle, header, state, request),
@@ -896,7 +897,10 @@ fn replyWindowAction(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.a
             // Allocation is rare. Reclaim only positively retired controller
             // generations using the existing canonical owner query; no timer.
             for (&state.actions.slots) |slot| if (slot.used and processHandleGone(ctx, slot.token.controller)) state.actions.retireController(slot.token.controller);
-            break :block state.actions.grant(request.token, caller, actionLaunch(state, request.token.request), liveCaller(ctx, request.token.controller.instance_id, request.token.controller) != null);
+            state.actions.expire(now);
+            break :block state.actions.grantBounded(request.token, caller, actionLaunch(state, request.token.request),
+                liveCaller(ctx, request.token.controller.instance_id, request.token.controller) != null,
+                now, ctx.ticksFromMilliseconds(a.desktop_action_pointer_max_duration_ms));
         },
         a.desktop_action_op_command => if (request.token.window.serial == 0) state.actions.command(request, caller, now, true) else if (request.deadline > now and request.deadline - now > ctx.ticksFromMilliseconds(a.desktop_action_max_timeout_ms))
             .{ .request = request, .result = a.desktop_action_result_invalid }
@@ -918,7 +922,9 @@ fn replyWindowAction(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.a
 fn replyDesktopWindow(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
     const a = r4os.abi;
     var response: a.DesktopWindowReply = .{ .mode = .{ .result = window_mode.invalid }, .action = .{ .result = a.desktop_action_result_invalid } };
-    if (decodeFixed(a.DesktopWindowExchange, payload)) |incoming| {
+    const extended = if (header.op == a.desktop_action_op_exchange_focus) decodeFixed(a.DesktopWindowExchangeV2, payload) else null;
+    const legacy = if (header.op == a.desktop_action_op_exchange) decodeFixed(a.DesktopWindowExchange, payload) else null;
+    if (if (extended) |v| v.previous else legacy) |incoming| {
         var request = incoming;
         const owner = request.mode.identity;
         if (desktopCaller(ctx, header.client_id, owner.desktop, state) == null) {
@@ -949,10 +955,28 @@ fn replyDesktopWindow(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.
                         .{ .request = request.ack, .result = a.desktop_action_result_not_owner }
                     else
                         state.actions.exchange(request, ctx.ticks());
+                    if (extended) |v| {
+                        var focus = v.focus;
+                        if (focus.window.serial == 0) focus.window = response.mode.identity;
+                        if (!state.actions.publishFocus(focus) and response.mode.identity.window_id < state.actions.focus.len)
+                            state.actions.focus[response.mode.identity.window_id] = .{};
+                    }
                 }
             }
         }
     }
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_ok, std.mem.asBytes(&response));
+}
+
+fn replyFocusSnapshot(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const a = r4os.abi;
+    const expected = decodeFixed(a.WindowModeIdentity, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_invalid, "FOCUSBAD");
+    var caller: a.ProgramProcessHandle = .{};
+    const response: a.DesktopFocusReply = if (ctx.programOpenHandle(header.client_id, &caller) != 0 or liveCaller(ctx, header.client_id, caller) == null)
+        .{ .result = a.desktop_focus_result_stale }
+    else
+        state.actions.focusSnapshot(caller, expected, ctx.ticks(), ctx.ticksFromMilliseconds(1000));
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_ok, std.mem.asBytes(&response));
 }
 

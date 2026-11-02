@@ -160,3 +160,63 @@ test "grant quota is bounded and positively dead controller reuse never resurrec
     b.retireController(token.controller);
     try t.expectEqual(a.desktop_action_result_quota, b.grant(token, token.request, source, true).result);
 }
+
+test "focus snapshot is own-only, exact-incarnation and read-only" {
+    var b = broker();
+    const view = state(&b, 1);
+    try t.expect(b.publish(view));
+    const focus: a.DesktopFocusSnapshot = .{ .window = view.window, .view_revision = 1,
+        .input_revision = 8, .observed_tick = 20, .focus_state = a.desktop_focus_state_focused, .flags = 1 };
+    try t.expect(b.publishFocus(focus));
+    const result = b.focusSnapshot(handle(3), view.window, 21, 10);
+    try t.expectEqual(a.desktop_focus_result_ok, result.result);
+    try t.expectEqual(@as(u64, 8), result.snapshot.input_revision);
+    var stale = view.window;
+    stale.serial += 1;
+    try t.expectEqual(a.desktop_focus_result_stale, b.focusSnapshot(handle(3), stale, 21, 10).result);
+    try t.expectEqual(a.desktop_focus_result_missing, b.focusSnapshot(handle(4), .{ .window_id = 2 }, 21, 10).result);
+    try t.expectEqual(a.desktop_focus_result_unknown, b.focusSnapshot(handle(3), view.window, 32, 10).result);
+    try t.expect(b.publish(state(&b, 2)));
+    try t.expectEqual(a.desktop_focus_result_unknown, b.focusSnapshot(handle(3), view.window, 22, 10).result);
+}
+
+test "pointer grant bounds one outside drag and retains each original receipt" {
+    var b = broker();
+    const view = state(&b, 1);
+    var token = b.scope().request.token;
+    token.request = handle(4);
+    token.controller = handle(5);
+    token.rights = a.desktop_action_right_pointer;
+    const launch: w.Launch = .{ .request = token.request, .owner = handle(3), .desktop = handle(2), .window_id = 2 };
+    try t.expectEqual(a.desktop_action_result_pending, b.grantBounded(token, token.request, launch, true, 10, 100).result);
+    try t.expect(b.publish(view));
+    try t.expect(b.publishFocus(.{ .window = view.window, .view_revision = view.view_revision,
+        .input_revision = 9, .observed_tick = 10, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    token = b.grantBounded(token, token.request, launch, true, 10, 100).request.token;
+    try t.expectEqual(view.window.serial, token.window.serial);
+    var down: w.Request = .{ .token = token, .operation = 1, .deadline = 100,
+        .kind = a.desktop_action_kind_pointer_down, .x = 100, .y = 100 };
+    try t.expectEqual(a.desktop_action_phase_pending, b.command(down, handle(5), 11, true).phase);
+    try t.expectEqual(a.desktop_action_phase_pending, b.exchange(.{ .state = view }, 12).phase);
+    const ack: a.DesktopWindowExchange = .{ .state = view, .ack = down, .applied = view, .applied_tick = 13, .flags = 1 };
+    try t.expectEqual(a.desktop_action_phase_applied, b.exchange(ack, 14).phase);
+    try t.expectEqual(a.desktop_action_phase_applied, b.exchange(ack, 15).phase);
+    var move = down;
+    move.operation = 2;
+    move.kind = a.desktop_action_kind_pointer_move;
+    move.x = 10;
+    move.y = 90;
+    try t.expectEqual(a.desktop_action_phase_pending, b.command(move, handle(5), 16, true).phase);
+    try t.expectEqual(a.desktop_action_phase_pending, b.exchange(.{ .state = view }, 17).phase);
+    try t.expectEqual(a.desktop_action_phase_applied, b.exchange(.{ .state = view, .ack = move, .applied = view, .applied_tick = 18, .flags = 1 }, 19).phase);
+    var up = move;
+    up.operation = 3;
+    up.kind = a.desktop_action_kind_pointer_up;
+    try t.expectEqual(a.desktop_action_phase_pending, b.command(up, handle(5), 20, true).phase);
+    try t.expectEqual(a.desktop_action_phase_pending, b.exchange(.{ .state = view }, 21).phase);
+    try t.expectEqual(a.desktop_action_phase_applied, b.exchange(.{ .state = view, .ack = up, .applied = view, .applied_tick = 22, .flags = 1 }, 23).phase);
+    down.operation = 4;
+    try t.expectEqual(a.desktop_action_result_invalid, b.command(down, handle(5), 24, true).result);
+    b.expire(111);
+    try t.expectEqual(a.desktop_action_phase_expired, b.status(token, 0, 111).phase);
+}
