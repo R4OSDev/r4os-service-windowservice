@@ -409,6 +409,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.desktop_action_op_scope, r4os.abi.desktop_action_op_grant, r4os.abi.desktop_action_op_command, r4os.abi.desktop_action_op_status, r4os.abi.desktop_action_op_release, r4os.abi.desktop_action_op_app_view, r4os.abi.desktop_action_op_app_frame => replyWindowAction(ctx, handle, header, state, request),
         r4os.abi.desktop_action_op_exchange, r4os.abi.desktop_action_op_exchange_focus => replyDesktopWindow(ctx, handle, header, state, request),
         r4os.abi.desktop_action_op_focus_snapshot => replyFocusSnapshot(ctx, handle, header, state, request),
+        r4os.abi.composition_op_capability, r4os.abi.composition_op_focus => replyComposition(ctx, handle, header, state, request),
         r4os.abi.desktop_evidence_op_scope, r4os.abi.desktop_evidence_op_reserve, r4os.abi.desktop_evidence_op_offer, r4os.abi.desktop_evidence_op_ack, r4os.abi.desktop_evidence_op_status, r4os.abi.desktop_evidence_op_read, r4os.abi.desktop_evidence_op_release => replyEvidence(ctx, handle, header, state, request),
         graphics_markers.operation => replyGraphicsMarkers(ctx, handle, header, state, request),
         launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete, launch_wire.received => replyLaunch(ctx, handle, header, state, request),
@@ -977,14 +978,33 @@ fn replyDesktopWindow(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.
                     if (extended) |v| {
                         var focus = v.focus;
                         if (focus.window.serial == 0) focus.window = response.mode.identity;
-                        if (!state.actions.publishFocus(focus) and response.mode.identity.window_id < state.actions.focus.len)
+                        if (!state.actions.publishFocus(focus) and response.mode.identity.window_id < state.actions.focus.len) {
                             state.actions.focus[response.mode.identity.window_id] = .{};
+                            state.actions.invalidateCompositionFocus(response.mode.identity);
+                        }
                     }
                 }
             }
         }
     }
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_ok, std.mem.asBytes(&response));
+}
+
+fn replyComposition(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
+    const a = r4os.abi;
+    if (header.op == a.composition_op_capability) {
+        if (payload.len != 0) return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_invalid, "COMPOSITIONBAD");
+        const response = state.actions.compositionCapability();
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, std.mem.asBytes(&response));
+    }
+    const expected = decodeFixed(a.WindowModeIdentity, payload) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, a.service_api_result_invalid, "COMPOSITIONBAD");
+    var caller: a.ProgramProcessHandle = .{};
+    const response: a.CompositionFocusReply = if (ctx.programOpenHandle(header.client_id, &caller) != 0 or liveCaller(ctx, header.client_id, caller) == null)
+        .{ .result = a.composition_error_stale_view }
+    else
+        state.actions.compositionFocus(caller, expected, ctx.ticks(), ctx.ticksFromMilliseconds(1000));
+    return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, std.mem.asBytes(&response));
 }
 
 fn replyFocusSnapshot(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {

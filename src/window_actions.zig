@@ -82,6 +82,12 @@ pub const Broker = struct {
     states: [a.window_service_max_windows]State = @splat(.{}),
     candidates: [a.window_service_max_windows]u64 = @splat(0),
     focus: [a.window_service_max_windows]a.DesktopFocusSnapshot = @splat(.{}),
+    // A derived acknowledgement from this same original window/focus owner,
+    // not another window registry. Input revision is freshness, not focus ID.
+    composition_focus: a.CompositionFocus = .{},
+    composition_serial: u64 = 0,
+    composition_desktop: Handle = .{},
+    composition_input_revision: u64 = 0,
 
     pub fn scope(self: *const Broker) Reply {
         return .{ .request = .{ .token = .{ .window = .{ .service = self.service }, .epoch = self.epoch } }, .result = if (valid(self.service) and nonzero(self.epoch)) 0 else a.desktop_action_result_unavailable };
@@ -168,11 +174,10 @@ pub const Broker = struct {
         if (self.serial == std.math.maxInt(u64)) return reject(token, a.desktop_action_result_quota);
         for (&self.slots) |*s| if (!s.used or s.phase == a.desktop_action_phase_released or
             (token.rights == a.desktop_action_right_pointer and
-                (s.phase == a.desktop_action_phase_expired or s.phase == a.desktop_action_phase_ended))) {
+                (s.phase == a.desktop_action_phase_expired or s.phase == a.desktop_action_phase_ended)))
+        {
             self.serial += 1;
-            s.* = .{ .used = true, .token = token, .launch = launch,
-                .pointer_basis = pointer_input,
-                .pointer_until = if (pointer_state != null) now +| duration else 0 };
+            s.* = .{ .used = true, .token = token, .launch = launch, .pointer_basis = pointer_input, .pointer_until = if (pointer_state != null) now +| duration else 0 };
             s.token.grant = self.serial;
             self.bindKnown(s);
             self.revision +|= 1;
@@ -198,6 +203,7 @@ pub const Broker = struct {
     }
     pub fn removeWindow(self: *Broker, identity: a.WindowModeIdentity) void {
         if (identity.serial == 0) return;
+        self.invalidateCompositionFocus(identity);
         for (&self.states, 0..) |*s, i| if (sameWindow(s.window, identity)) {
             s.* = .{};
             self.candidates[i] = 0;
@@ -252,8 +258,61 @@ pub const Broker = struct {
         if (sameWindow(previous.window, snapshot.window) and
             (snapshot.input_revision < previous.input_revision or snapshot.observed_tick < previous.observed_tick or
                 (snapshot.input_revision == previous.input_revision and snapshot.observed_tick == previous.observed_tick and !std.meta.eql(snapshot, previous)))) return false;
+        self.updateCompositionFocus(snapshot);
         self.focus[index] = snapshot;
         return true;
+    }
+    pub fn invalidateCompositionFocus(self: *Broker, identity: a.WindowModeIdentity) void {
+        if (sameWindow(self.composition_focus.window, identity)) self.composition_focus = .{};
+    }
+    fn updateCompositionFocus(self: *Broker, snapshot: a.DesktopFocusSnapshot) void {
+        if (!same(snapshot.window.desktop, self.composition_desktop)) {
+            self.composition_desktop = snapshot.window.desktop;
+            self.composition_input_revision = 0;
+            self.composition_focus = .{};
+        }
+        // A delayed publication for another window cannot restore a focus
+        // which a newer acknowledged Desktop input revision already replaced.
+        if (snapshot.input_revision < self.composition_input_revision) return;
+        self.composition_input_revision = snapshot.input_revision;
+        if (snapshot.input_revision == std.math.maxInt(u64)) {
+            // The old publisher saturates this ordering context. Preserve
+            // its old API while refusing unorderable new focus authority.
+            self.composition_focus = .{};
+            return;
+        }
+        if (snapshot.focus_state != a.desktop_focus_state_focused) {
+            self.invalidateCompositionFocus(snapshot.window);
+            return;
+        }
+        const old = self.composition_focus;
+        const changed = old.focused != 1 or !sameWindow(old.window, snapshot.window) or old.view_generation != snapshot.view_revision;
+        if (changed) {
+            if (self.composition_serial == std.math.maxInt(u64)) {
+                self.composition_focus = .{};
+                return;
+            }
+            self.composition_serial += 1;
+        }
+        self.composition_focus = .{ .window = snapshot.window, .view_generation = snapshot.view_revision, .focus_generation = self.composition_serial, .input_revision = snapshot.input_revision, .observed_tick = snapshot.observed_tick, .focused = 1 };
+    }
+    pub fn compositionCapability(_: *const Broker) a.CompositionCapabilityReply {
+        // No qualified inputmethod is installed or registered. Never turn a
+        // keyboard, transport endpoint or test fixture into a languageIME.
+        return .{ .result = a.composition_error_no_provider };
+    }
+    pub fn compositionFocus(self: *const Broker, caller: Handle, expected: a.WindowModeIdentity, now: u64, freshness: u64) a.CompositionFocusReply {
+        if (!valid(caller) or !same(expected.owner, caller) or !same(expected.service, self.service) or
+            !valid(expected.desktop) or expected.reserved != 0 or expected.serial == 0 or expected.window_id >= self.states.len)
+            return .{ .result = a.composition_error_stale_view };
+        const current_view = self.states[expected.window_id];
+        if (!sameWindow(expected, current_view.window)) return .{ .result = a.composition_error_stale_view };
+        const value = self.composition_focus;
+        if (value.focused != 1 or !sameWindow(value.window, expected) or value.view_generation != current_view.view_revision or
+            current_view.info.flags & 1 == 0 or current_view.info.flags & 2 != 0 or
+            value.observed_tick == 0 or now < value.observed_tick or now - value.observed_tick > freshness)
+            return .{ .result = a.composition_error_no_focus };
+        return .{ .focus = value };
     }
     pub fn focusSnapshot(self: *const Broker, caller: Handle, expected: a.WindowModeIdentity, now: u64, freshness: u64) a.DesktopFocusReply {
         if (!valid(caller) or expected.window_id >= self.states.len or (valid(expected.owner) and !same(expected.owner, caller)))

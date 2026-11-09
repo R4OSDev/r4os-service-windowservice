@@ -165,8 +165,7 @@ test "focus snapshot is own-only, exact-incarnation and read-only" {
     var b = broker();
     const view = state(&b, 1);
     try t.expect(b.publish(view));
-    const focus: a.DesktopFocusSnapshot = .{ .window = view.window, .view_revision = 1,
-        .input_revision = 8, .observed_tick = 20, .focus_state = a.desktop_focus_state_focused, .flags = 1 };
+    const focus: a.DesktopFocusSnapshot = .{ .window = view.window, .view_revision = 1, .input_revision = 8, .observed_tick = 20, .focus_state = a.desktop_focus_state_focused, .flags = 1 };
     try t.expect(b.publishFocus(focus));
     const result = b.focusSnapshot(handle(3), view.window, 21, 10);
     try t.expectEqual(a.desktop_focus_result_ok, result.result);
@@ -190,12 +189,10 @@ test "pointer grant bounds one outside drag and retains each original receipt" {
     const launch: w.Launch = .{ .request = token.request, .owner = handle(3), .desktop = handle(2), .window_id = 2 };
     try t.expectEqual(a.desktop_action_result_pending, b.grantBounded(token, token.request, launch, true, 10, 100).result);
     try t.expect(b.publish(view));
-    try t.expect(b.publishFocus(.{ .window = view.window, .view_revision = view.view_revision,
-        .input_revision = 9, .observed_tick = 10, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    try t.expect(b.publishFocus(.{ .window = view.window, .view_revision = view.view_revision, .input_revision = 9, .observed_tick = 10, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
     token = b.grantBounded(token, token.request, launch, true, 10, 100).request.token;
     try t.expectEqual(view.window.serial, token.window.serial);
-    var down: w.Request = .{ .token = token, .operation = 1, .deadline = 100,
-        .kind = a.desktop_action_kind_pointer_down, .x = 100, .y = 100 };
+    var down: w.Request = .{ .token = token, .operation = 1, .deadline = 100, .kind = a.desktop_action_kind_pointer_down, .x = 100, .y = 100 };
     try t.expectEqual(a.desktop_action_phase_pending, b.command(down, handle(5), 11, true).phase);
     try t.expectEqual(a.desktop_action_phase_pending, b.exchange(.{ .state = view }, 12).phase);
     const ack: a.DesktopWindowExchange = .{ .state = view, .ack = down, .applied = view, .applied_tick = 13, .flags = 1 };
@@ -210,11 +207,9 @@ test "pointer grant bounds one outside drag and retains each original receipt" {
     // Keep the gesture bound to input/window identity, not cosmetic revisions.
     view = state(&b, 2);
     try t.expect(b.publish(view));
-    try t.expect(b.publishFocus(.{ .window = view.window, .view_revision = 2,
-        .input_revision = 9, .observed_tick = 15, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    try t.expect(b.publishFocus(.{ .window = view.window, .view_revision = 2, .input_revision = 9, .observed_tick = 15, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
     var invalidated = b;
-    try t.expect(invalidated.publishFocus(.{ .window = view.window, .view_revision = 2,
-        .input_revision = 10, .observed_tick = 16, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    try t.expect(invalidated.publishFocus(.{ .window = view.window, .view_revision = 2, .input_revision = 10, .observed_tick = 16, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
     try t.expectEqual(a.desktop_action_result_stale, invalidated.command(move, handle(5), 16, true).result);
     try t.expectEqual(a.desktop_action_phase_pending, b.command(move, handle(5), 16, true).phase);
     try t.expectEqual(a.desktop_action_phase_pending, b.exchange(.{ .state = view }, 17).phase);
@@ -229,4 +224,65 @@ test "pointer grant bounds one outside drag and retains each original receipt" {
     try t.expectEqual(a.desktop_action_result_invalid, b.command(down, handle(5), 24, true).result);
     b.expire(111);
     try t.expectEqual(a.desktop_action_phase_expired, b.status(token, 0, 111).phase);
+}
+
+test "composition focus uses separate nonwrapping epoch and unique acknowledged window" {
+    var b = broker();
+    const first = state(&b, 1);
+    try t.expect(b.publish(first));
+    var f: a.DesktopFocusSnapshot = .{ .window = first.window, .view_revision = 1, .input_revision = 8, .observed_tick = 20, .focus_state = a.desktop_focus_state_focused, .flags = 1 };
+    try t.expect(b.publishFocus(f));
+    const original = b.compositionFocus(handle(3), first.window, 21, 10);
+    try t.expectEqual(@as(i32, 0), original.result);
+    f.input_revision = 9;
+    f.observed_tick = 22;
+    try t.expect(b.publishFocus(f));
+    try t.expectEqual(original.focus.focus_generation, b.compositionFocus(handle(3), first.window, 23, 10).focus.focus_generation);
+    var second = first;
+    second.window.window_id = 1;
+    second.window.serial = 78;
+    second.window.owner = handle(4);
+    second.info.window_id = 1;
+    try t.expect(b.publish(second));
+    try t.expect(b.publishFocus(.{ .window = second.window, .view_revision = 1, .input_revision = 10, .observed_tick = 24, .focus_state = a.desktop_focus_state_focused, .flags = 1 }));
+    try t.expectEqual(a.composition_error_no_focus, b.compositionFocus(handle(3), first.window, 25, 10).result);
+    const next = b.compositionFocus(handle(4), second.window, 25, 10);
+    try t.expectEqual(@as(i32, 0), next.result);
+    try t.expect(next.focus.focus_generation > original.focus.focus_generation);
+    // Delayed old-window publication may satisfy the older per-window API,
+    // but cannot replace the newer globally acknowledged composition focus.
+    f.observed_tick = 25;
+    try t.expect(b.publishFocus(f));
+    try t.expectEqual(@as(i32, 0), b.compositionFocus(handle(4), second.window, 26, 10).result);
+    try t.expectEqual(a.composition_error_stale_view, b.compositionFocus(handle(3), second.window, 26, 10).result);
+    b.removeWindow(second.window);
+    try t.expectEqual(a.composition_error_stale_view, b.compositionFocus(handle(4), second.window, 26, 10).result);
+}
+test "composition focus rejects stale view provider absence expired acknowledgement and epoch exhaustion" {
+    var b = broker();
+    const view = state(&b, 1);
+    try t.expect(b.publish(view));
+    var f: a.DesktopFocusSnapshot = .{ .window = view.window, .view_revision = 1, .input_revision = 8, .observed_tick = 20, .focus_state = a.desktop_focus_state_focused, .flags = 1 };
+    try t.expect(b.publishFocus(f));
+    try t.expectEqual(a.composition_error_no_focus, b.compositionFocus(handle(3), view.window, 31, 10).result);
+    const missing = b.compositionCapability();
+    try t.expectEqual(a.composition_error_no_provider, missing.result);
+    try t.expectEqual(@as(u32, 0), missing.provider.features);
+    try t.expect(b.publish(state(&b, 2)));
+    try t.expectEqual(a.composition_error_no_focus, b.compositionFocus(handle(3), view.window, 22, 10).result);
+    f.view_revision = 2;
+    f.observed_tick = 22;
+    try t.expect(b.publishFocus(f));
+    try t.expectEqual(@as(i32, 0), b.compositionFocus(handle(3), view.window, 23, 10).result);
+    var unordered = b;
+    var saturated = f;
+    saturated.input_revision = std.math.maxInt(u64);
+    saturated.observed_tick = 23;
+    try t.expect(unordered.publishFocus(saturated));
+    try t.expectEqual(a.composition_error_no_focus, unordered.compositionFocus(handle(3), view.window, 24, 10).result);
+    b.composition_serial = std.math.maxInt(u64);
+    b.invalidateCompositionFocus(view.window);
+    f.observed_tick = 24;
+    try t.expect(b.publishFocus(f));
+    try t.expectEqual(a.composition_error_no_focus, b.compositionFocus(handle(3), view.window, 25, 10).result);
 }
