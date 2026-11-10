@@ -148,3 +148,15 @@ ReferenzGET normalisiert gleich; OriginalSHA256 d538b089c24b973ba14209cdad415fed
 Gesamt135.521406/IPC141.872165 gegen59 137.870960/146.849660 unisoliert;
 keinSpeedup-/Noise-/Regressionsursachenbeweis und keinScore-/Uploadrerun.
 Alle Originale/Kontexte/SHA256 unter ExFiles/Reports/Benchmarks/87c87a4d-427c-4a9f-8c22-ac49e189dd03/.
+
+Anschluss Generation2 (0.90.59)
+------------------------------
+Normale SDK196-Auswahl: SDK_PROFILE=r4os-zig-generation2, App2/R4XStart2 und
+Query2:2 fuer Plattformimporte. Unabhaengige R4STD-Interfaces behalten ihren
+eigenen Vertrag. Registrierung verwendet ein gemeinsames100Tick-Budget
+mit wirklicher Clock statt eines pro Versuch erneuerten Iterationsbudgets.
+
+WINSVC behaelt seine Fenster-/Tray-/Launch-/Fokus-/Bildbroker und exakten Prozessgenerationen. Queues und Bildrevisionen werden vor dem bestehenden Aktivitaetsnotify publiziert. Fokusgeneration ist getrennt von gewoehnlicher Eingaberevision; der vorhandene Kompositionsstatus bleibt NoProvider ohne qualifizierte IME. Originale Maintenance-Tests verwenden reale Query2-Tabellenadapter.
+
+Build ueber ./Build.sh beziehungsweise Build.bat; beide verwenden dieselbe
+PowerShell7-Logik. Version, Klasse, Ziel und Imports stehen in module.R4MF.

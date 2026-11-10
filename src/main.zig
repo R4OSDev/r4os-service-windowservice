@@ -49,14 +49,15 @@ const SweepProbe = struct {
 };
 
 const SweepFixture = struct {
-    raw: r4os.abi.R4XStartContext = .{},
-    table: r4os.abi.R4XStartR4Sys = .{},
-    bundle: r4os.program.Bundle = undefined,
+    raw: r4os.platform2.abi.R4XStartContext2 = .{},
+    table: r4os.platform2.abi.R4XStartR4Sys2 = .{},
+    actual: r4os.platform2.Context = undefined,
     fn context(self: *SweepFixture) r4os.r4sys.Context {
         self.table.ticks = @intFromPtr(&SweepProbe.ticks);
         self.table.program_handle_status = @intFromPtr(&SweepProbe.status);
-        self.bundle = .{ .raw = &self.raw, .sys = &self.table };
-        return r4os.r4sys.Context.init(&self.bundle);
+        self.actual = .{ .raw = &self.raw };
+        self.actual.tables[0] = @intFromPtr(&self.table);
+        return r4os.r4sys.Context.fromProgram(.{ .generation2 = &self.actual });
     }
 };
 
@@ -66,10 +67,8 @@ test "WINSVC maintenance empty service has no periodic owner deadline" {
 }
 
 test "WINSVC maintenance one exact owner is queried once across actual brokers" {
-    var raw: r4os.abi.R4XStartContext = .{};
-    var table: r4os.abi.R4XStartR4Sys = .{ .ticks = @intFromPtr(&SweepProbe.ticks), .program_handle_status = @intFromPtr(&SweepProbe.status) };
-    var bundle: r4os.program.Bundle = .{ .raw = &raw, .sys = &table };
-    const ctx = r4os.r4sys.Context.init(&bundle);
+    var fixture: SweepFixture = .{};
+    const ctx = fixture.context();
     var state = ServiceState{};
     const owner: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
     _ = state.tray.bindDesktop(owner);
@@ -239,7 +238,7 @@ var status_reply: r4os.abi.WindowServiceStatus = .{};
 var result_reply: r4os.abi.WindowServiceResult = .{};
 var snapshot_reply: r4os.abi.WindowServiceSnapshot = .{};
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var ctx = r4_app.system();
     if (hasArg(ctx.argsRaw(), selftest_arg)) return runSelfTest(&ctx);
     if (hasArg(ctx.argsRaw(), ping_arg)) return runPing(&ctx);
@@ -314,8 +313,11 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
 
     var info: r4os.abi.ServiceInfo = .{};
     var handle: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < 100 and handle == 0) : (waited += 1) {
+    const actual = ctx.base.generation2 orelse return r4os.abi.err_no_group;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return r4os.abi.err_no_fn;
+    var registration_budget = r4os.rpc_budget.Budget.fromTicks(clock.read, 100) catch |err| return r4os.rpc_budget.code(err);
+    while (handle == 0 and !ctx.programShouldClose()) {
+        _ = registration_budget.remainingTicks() catch break;
         const rc = ctx.serviceEndpointRegister(service_name, 0, &info);
         if (rc == r4os.abi.service_api_result_ok and info.handle != 0) {
             handle = info.handle;
