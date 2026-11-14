@@ -138,3 +138,11 @@ all actions, clamp, saved-token C/Rust/Zig, QMP actual pixels/physical input,
 normal close and separate actual GUI-slot reuse. Private trace copies are
 diagnostic-only; clean native artifacts contain none of that instrumentation.
 Full contracts/evidence: workspace Docs/Desktop/DeskRun.txt.
+
+## Published tray changes (0.91.2)
+
+The main owner coalesces changed tray, graphics-image and window-mode revisions
+into one Desktop activity notification after each drained batch. Tray state is
+already published when Desktop wakes. Unchanged upserts, read-only desktop_sync
+and owner sweeps remain silent; owner cleanup and actual removals notify.
+The existing owner-test includes the actual Generation2 notification adapter.

@@ -66,6 +66,65 @@ test "WINSVC maintenance empty service has no periodic owner deadline" {
     try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
 }
 
+test "WINSVC maintenance published tray revisions wake Desktop once per changed batch" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var observed: u64 = 0;
+        var state: ?*const ServiceState = null;
+        fn notify() callconv(.c) i32 {
+            calls += 1;
+            observed = state.?.tray.revision;
+            return 0;
+        }
+    };
+    var raw: r4os.platform2.abi.R4XStartContext2 = .{};
+    var table: r4os.platform2.abi.R4XStartR4Desk2 = .{};
+    table.desktop_activity_notify = @intFromPtr(&Probe.notify);
+    var actual: r4os.platform2.Context = .{ .raw = &raw };
+    actual.tables[1] = @intFromPtr(&table);
+    var state: ServiceState = .{ .desktop = r4os.r4desk.Context.fromProgram(.{ .generation2 = &actual }) };
+    Probe.calls = 0;
+    Probe.state = &state;
+    defer Probe.state = null;
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+    const desktop: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    try std.testing.expect(state.tray.bindDesktop(desktop));
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(state.tray.revision, Probe.observed);
+    var item: r4os.abi.TrayServiceRequest = .{
+        .owner = .{ .instance_id = 10, .generation = 101 },
+        .item_id = 1,
+        .item_revision = 1,
+        .item_flags = r4os.abi.tray_item_flag_visible | r4os.abi.tray_item_flag_enabled,
+        .icon_width = r4os.abi.tray_icon_width,
+        .icon_height = r4os.abi.tray_icon_height,
+        .icon_format = r4os.abi.tray_icon_format_argb32,
+    };
+    try std.testing.expectEqual(r4os.abi.tray_result_ok, state.tray.upsert(&item).result);
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expectEqual(state.tray.revision, Probe.observed);
+    _ = state.tray.upsert(&item);
+    _ = state.tray.desktopSync(&.{ .desktop_owner = desktop, .known_revision = state.tray.revision, .cursor = r4os.abi.tray_desktop_cursor_poll });
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    item.item_revision += 1;
+    _ = state.tray.upsert(&item);
+    _ = state.tray.remove(item.owner, item.item_id);
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 3), Probe.calls);
+    try std.testing.expectEqual(state.tray.revision, Probe.observed);
+    _ = state.tray.clearDesktop();
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 4), Probe.calls);
+    state.graphics.image_revision += 1;
+    state.modes.revision += 1;
+    notifyDesktop(&state);
+    try std.testing.expectEqual(@as(usize, 5), Probe.calls);
+}
+
 test "WINSVC maintenance one exact owner is queried once across actual brokers" {
     var fixture: SweepFixture = .{};
     const ctx = fixture.context();
@@ -226,6 +285,7 @@ const ServiceState = struct {
     graphics_platform: graphics_platform.Platform = .{},
     desktop: ?r4os.r4desk.Context = null,
     graphics_notified: u64 = 1,
+    tray_notified: u64 = 1,
     modes: window_mode.Broker = .{},
     actions: window_actions.Broker = .{},
     modes_notified: u64 = 1,
@@ -378,7 +438,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
             },
         }
         maintainTray(ctx, handle, &state);
-        notifyGraphics(&state);
+        notifyDesktop(&state);
     }
 
     service_loop.report(service_name);
@@ -388,12 +448,13 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     return 0;
 }
 
-fn notifyGraphics(state: *ServiceState) void {
-    if (state.graphics.image_revision == state.graphics_notified and state.modes.revision == state.modes_notified) return;
+fn notifyDesktop(state: *ServiceState) void {
+    if (state.graphics.image_revision == state.graphics_notified and state.modes.revision == state.modes_notified and state.tray.revision == state.tray_notified) return;
     state.modes_notified = state.modes.revision;
     state.graphics_notified = state.graphics.image_revision;
-    // Coalesce each drained batch after publishing its state. Ordinary tray
-    // sweeps and read-only queries do not manufacture a GPU frame clock.
+    state.tray_notified = state.tray.revision;
+    // Publish first and coalesce each drained batch into one wake. Unchanged
+    // sweeps and read-only queries remain silent, including tray sync itself.
     if (state.desktop) |desktop| _ = desktop.desktopActivityNotify();
 }
 
@@ -1319,7 +1380,7 @@ fn clearAll(state: *ServiceState, reason: []const u8) void {
     while (i < state.slots.len) : (i += 1) state.slots[i] = .{};
     state.next_z = 1;
     noteChange(state, reason);
-    notifyGraphics(state);
+    notifyDesktop(state);
 }
 
 fn selectFallbackFocus(state: *ServiceState) void {
