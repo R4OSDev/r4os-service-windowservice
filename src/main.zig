@@ -18,8 +18,9 @@ const desktop_diagnostics = @import("desktop_diagnostics");
 const service_name = "WINSVC";
 const selftest_arg = "/SELFTEST";
 const ping_arg = "/PING";
-const service_timeout_ticks: u64 = 120;
-const tray_owner_sweep_ticks: u64 = 50;
+const service_timeout_ms: u64 = 1200;
+const service_register_wait_ms: u64 = 1000;
+const tray_owner_sweep_ms: u64 = 500;
 const program_class_gui: u8 = 1;
 const program_state_done: u8 = 2;
 
@@ -28,16 +29,22 @@ const program_state_done: u8 = 2;
 const SweepProbe = struct {
     var calls: usize = 0;
     var now: u64 = 1000;
+    var hz: u32 = 100;
     var error_result: i32 = 0;
     var ended_generation: ?u64 = null;
     fn reset() void {
         calls = 0;
         now = 1000;
+        hz = 100;
         error_result = 0;
         ended_generation = null;
     }
     fn ticks() callconv(.c) u64 {
         return now;
+    }
+    fn clock(out: *r4os.abi.MonotonicClockInfo) callconv(.c) i32 {
+        out.* = .{ .flags = r4os.abi.monotonic_clock_flag_valid, .source = r4os.abi.monotonic_clock_source_tsc, .generation = 1, .instant_ns = if (hz == 0) 0 else now * 1_000_000_000 / hz, .resolution_ns = 1, .event_requested_hz = hz, .event_effective_hz = hz };
+        return 1;
     }
     fn status(owner: *const r4os.abi.ProgramProcessHandle, out: *r4os.abi.ProgramInstanceInfo) callconv(.c) i32 {
         calls += 1;
@@ -54,6 +61,7 @@ const SweepFixture = struct {
     actual: r4os.platform2.Context = undefined,
     fn context(self: *SweepFixture) r4os.r4sys.Context {
         self.table.ticks = @intFromPtr(&SweepProbe.ticks);
+        self.table.monotonic_clock = @intFromPtr(&SweepProbe.clock);
         self.table.program_handle_status = @intFromPtr(&SweepProbe.status);
         self.actual = .{ .raw = &self.raw };
         self.actual.tables[0] = @intFromPtr(&self.table);
@@ -141,17 +149,31 @@ test "WINSVC maintenance one exact owner is queried once across actual brokers" 
 }
 
 test "WINSVC maintenance owner interest arms preserves and disarms its deadline" {
+    var fixture: SweepFixture = .{};
+    const ctx = fixture.context();
+    for ([_]u32{ 100, 1000 }) |hz| {
+        SweepProbe.reset();
+        SweepProbe.hz = hz;
+        var state = ServiceState{};
+        refreshOwnerSweep(&ctx, &state, 1000);
+        try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
+        try std.testing.expect(state.tray.bindDesktop(.{ .instance_id = 9, .generation = 100 }));
+        refreshOwnerSweep(&ctx, &state, 1000);
+        const due: u64 = 1000 + hz / 2; // same half-second at both frequencies
+        try std.testing.expectEqual(@as(?u64, due), nextServiceDeadline(&state));
+        refreshOwnerSweep(&ctx, &state, 1010);
+        try std.testing.expectEqual(@as(?u64, due), nextServiceDeadline(&state));
+        _ = state.tray.clearDesktop();
+        refreshOwnerSweep(&ctx, &state, 1020);
+        try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
+    }
+    SweepProbe.hz = 0;
     var state = ServiceState{};
-    refreshOwnerSweep(&state, 1000);
+    const owner: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
+    _ = state.tray.bindDesktop(owner);
+    refreshOwnerSweep(&ctx, &state, 1000);
     try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
-    try std.testing.expect(state.tray.bindDesktop(.{ .instance_id = 9, .generation = 100 }));
-    refreshOwnerSweep(&state, 1000);
-    try std.testing.expectEqual(@as(?u64, 1050), nextServiceDeadline(&state));
-    refreshOwnerSweep(&state, 1010);
-    try std.testing.expectEqual(@as(?u64, 1050), nextServiceDeadline(&state));
-    _ = state.tray.clearDesktop();
-    refreshOwnerSweep(&state, 1020);
-    try std.testing.expectEqual(@as(?u64, null), nextServiceDeadline(&state));
+    try std.testing.expectEqualDeep(owner, state.tray.desktop_owner);
 }
 
 test "WINSVC maintenance unknown status is retained and next sweep refreshes it" {
@@ -375,7 +397,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     var handle: u32 = 0;
     const actual = ctx.base.generation2 orelse return r4os.abi.err_no_group;
     const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return r4os.abi.err_no_fn;
-    var registration_budget = r4os.rpc_budget.Budget.fromTicks(clock.read, 100) catch |err| return r4os.rpc_budget.code(err);
+    var registration_budget = r4os.rpc_budget.Budget.fromTicks(clock.read, ctx.ticksFromMilliseconds(service_register_wait_ms)) catch |err| return r4os.rpc_budget.code(err);
     while (handle == 0 and !ctx.programShouldClose()) {
         _ = registration_budget.remainingTicks() catch break;
         const rc = ctx.serviceEndpointRegister(service_name, 0, &info);
@@ -427,7 +449,7 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
                 }
                 // Owner identities are introduced by endpoint operations.
                 // Do not repeatedly scan empty tables on the central Stop wake.
-                refreshOwnerSweep(&state, ctx.ticks());
+                refreshOwnerSweep(ctx, &state, ctx.ticks());
             },
             .idle, .deadline => {},
             .stop => break,
@@ -549,12 +571,16 @@ fn hasSweepOwners(state: *const ServiceState) bool {
     return state.tray.ownerAt(0) != null;
 }
 
-fn refreshOwnerSweep(state: *ServiceState, now: u64) void {
+fn refreshOwnerSweep(ctx: *const r4os.r4sys.Context, state: *ServiceState, now: u64) void {
     if (!hasSweepOwners(state)) {
         state.next_tray_owner_sweep_tick = null;
-    } else if (state.next_tray_owner_sweep_tick == null) {
-        state.next_tray_owner_sweep_tick = now +| tray_owner_sweep_ticks;
+        return;
     }
+    if (state.next_tray_owner_sweep_tick != null) return;
+    const interval = ctx.ticksFromMilliseconds(tray_owner_sweep_ms);
+    // An unavailable clock is no evidence that an owner ended. Retain it
+    // without inventing a frequency or entering an immediate deadline loop.
+    if (interval != 0) state.next_tray_owner_sweep_tick = now +| interval;
 }
 
 const OwnerChecks = struct {
@@ -615,7 +641,7 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
             if (checks.gone(ctx, found.owner)) _ = state.tray.removeOwner(found.owner);
         }
         state.next_tray_owner_sweep_tick = null;
-        refreshOwnerSweep(state, now);
+        refreshOwnerSweep(ctx, state, now);
     }
 
     state.evidence.maintain(now, ctx.ticksFromMilliseconds(200));
@@ -1591,7 +1617,7 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
 
     var bad_header: r4os.abi.ServiceMessageHeader = .{};
     var bad_response: [16]u8 = undefined;
-    const bad = ctx.serviceCall(handle, 0x7FFE, "", &bad_header, bad_response[0..], service_timeout_ticks);
+    const bad = ctx.serviceCall(handle, 0x7FFE, "", &bad_header, bad_response[0..], ctx.ticksFromMilliseconds(service_timeout_ms));
     if (bad < 0 or bad_header.status != r4os.abi.service_api_result_bad_op) return fail(ctx, "bad-op");
 
     if (!callRecord(ctx, handle, r4os.abi.window_service_op_register, &first, r4os.abi.window_service_result_ok)) return fail(ctx, "register-restart");
@@ -1614,7 +1640,7 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
 fn callStatus(ctx: *const r4os.r4sys.Context, handle: u32, out: *r4os.abi.WindowServiceStatus) bool {
     var header: r4os.abi.ServiceMessageHeader = .{};
     @memset(service_response[0..], 0);
-    const got = ctx.serviceCall(handle, r4os.abi.window_service_op_status, "", &header, service_response[0..], service_timeout_ticks);
+    const got = ctx.serviceCall(handle, r4os.abi.window_service_op_status, "", &header, service_response[0..], ctx.ticksFromMilliseconds(service_timeout_ms));
     if (got < @as(i32, @intCast(@sizeOf(r4os.abi.WindowServiceStatus))) or header.status != r4os.abi.service_api_result_ok) return false;
     const out_bytes: [*]u8 = @ptrCast(out);
     @memcpy(out_bytes[0..@sizeOf(r4os.abi.WindowServiceStatus)], service_response[0..@sizeOf(r4os.abi.WindowServiceStatus)]);
@@ -1624,7 +1650,7 @@ fn callStatus(ctx: *const r4os.r4sys.Context, handle: u32, out: *r4os.abi.Window
 fn callSnapshot(ctx: *const r4os.r4sys.Context, handle: u32, out: *r4os.abi.WindowServiceSnapshot) bool {
     var header: r4os.abi.ServiceMessageHeader = .{};
     @memset(service_response[0..], 0);
-    const got = ctx.serviceCall(handle, r4os.abi.window_service_op_snapshot, "", &header, service_response[0..], service_timeout_ticks);
+    const got = ctx.serviceCall(handle, r4os.abi.window_service_op_snapshot, "", &header, service_response[0..], ctx.ticksFromMilliseconds(service_timeout_ms));
     if (got < @as(i32, @intCast(@sizeOf(r4os.abi.WindowServiceSnapshot))) or header.status != r4os.abi.service_api_result_ok) return false;
     const out_bytes: [*]u8 = @ptrCast(out);
     @memcpy(out_bytes[0..@sizeOf(r4os.abi.WindowServiceSnapshot)], service_response[0..@sizeOf(r4os.abi.WindowServiceSnapshot)]);
@@ -1635,7 +1661,7 @@ fn callRecord(ctx: *const r4os.r4sys.Context, handle: u32, op: u16, record: *con
     var header: r4os.abi.ServiceMessageHeader = .{};
     const request: [*]const u8 = @ptrCast(record);
     @memset(service_response[0..], 0);
-    const got = ctx.serviceCall(handle, op, request[0..@sizeOf(r4os.abi.WindowServiceRecord)], &header, service_response[0..], service_timeout_ticks);
+    const got = ctx.serviceCall(handle, op, request[0..@sizeOf(r4os.abi.WindowServiceRecord)], &header, service_response[0..], ctx.ticksFromMilliseconds(service_timeout_ms));
     if (got < @as(i32, @intCast(@sizeOf(r4os.abi.WindowServiceResult))) or header.status != r4os.abi.service_api_result_ok) return false;
     var result: r4os.abi.WindowServiceResult = .{};
     const result_bytes: [*]u8 = @ptrCast(&result);
@@ -1646,7 +1672,7 @@ fn callRecord(ctx: *const r4os.r4sys.Context, handle: u32, op: u16, record: *con
 fn callRestartCleanup(ctx: *const r4os.r4sys.Context, handle: u32) bool {
     var header: r4os.abi.ServiceMessageHeader = .{};
     @memset(service_response[0..], 0);
-    const got = ctx.serviceCall(handle, r4os.abi.window_service_op_restart_cleanup, "", &header, service_response[0..], service_timeout_ticks);
+    const got = ctx.serviceCall(handle, r4os.abi.window_service_op_restart_cleanup, "", &header, service_response[0..], ctx.ticksFromMilliseconds(service_timeout_ms));
     if (got < @as(i32, @intCast(@sizeOf(r4os.abi.WindowServiceResult))) or header.status != r4os.abi.service_api_result_ok) return false;
     var result: r4os.abi.WindowServiceResult = .{};
     const result_bytes: [*]u8 = @ptrCast(&result);

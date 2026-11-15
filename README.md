@@ -31,6 +31,14 @@ admitted `app.role=desktop_host` declaration (Kernel 0.1.238). A pending close
 or ambiguous process status retains the exact existing owner generation;
 only confirmed retirement permits rebinding to a restarted Desktop.
 
+Owner liveness checks run every 500 ms while owners exist. Registration and
+diagnostic calls use 1000 ms and 1200 ms budgets. These durations use the
+current logical clock; ordinary requests preserve an already armed sweep.
+Empty owner tables do not schedule sweeps. Tray, graphics, launch and
+diagnostic deadlines remain independent, and an unavailable clock retains
+existing owners. The existing maintenance tests cover 100 Hz, 1000 Hz and
+unknown frequency without changing the exact process-generation rules.
+
 Roadmap 0.82.27 qualifies actual GA106 WSI pixel/depth readbacks, regular
 Desktop window/fullscreen/resize/occlusion, source FP16/PQ capture, retained
 producer fences beyond Deviceclose, full Desktop restart with surviving GUI,
