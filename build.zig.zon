@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .r4os_r4desk = .{
-            .url = "https://github.com/R4OSDev/r4os-app-desktop/archive/8e9d6ecc44b88dd82058610df9dc3d62cc10de54.tar.gz",
-            .hash = "r4os_r4desk-0.1.234-ZKSbeMnpPQAkJagcqtrEdMi5aXN6xVabkWXlcLi0-Z-3",
+            .url = "https://github.com/R4OSDev/r4os-app-desktop/archive/df72eaa51b1b048c5e36a0fed7efb8a861322c23.tar.gz",
+            .hash = "r4os_r4desk-0.1.234-ZKSbeMnpPQBOFlaVGv01EFpPbAfrRzPPQ5yoY9RBrjNu",
         },
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/d7b4891e9454de79b8d43fcf20b535343d0f64ce.tar.gz",
-            .hash = "r4os_sdk-0.64.241-NnPzAtjGGgLj_VqEM-8nHxYTqFNo4BMHqM4aa4OlaxiD",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/09dfbac633e9132a2f85ae77536a7d66106266c3.tar.gz",
+            .hash = "r4os_sdk-0.64.242-NnPzAmrkGgJkR_UOsahhLRMDGzcKF_os0tGM1fjv5f_X",
         },
     },
     .paths = .{
