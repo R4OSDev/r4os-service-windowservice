@@ -1259,6 +1259,18 @@ fn replyAction(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, sta
 }
 
 fn performAction(state: *ServiceState, op: u16, request: []const u8) r4os.abi.WindowServiceResult {
+    // Full records carry the originating process. A delayed mutation must
+    // not reach a replacement window at the same legacy routing index.
+    if (op != r4os.abi.window_service_op_register and request.len == @sizeOf(r4os.abi.WindowServiceRecord)) {
+        if (requestRecord(request)) |record| {
+            if (record.instance_id != 0) {
+                if (findSlot(state, record.window_id)) |i| {
+                    if (state.slots[i].record.instance_id != record.instance_id)
+                        return failResult(state, op, r4os.abi.window_service_result_not_found, "stale-window");
+                }
+            }
+        }
+    }
     return switch (op) {
         r4os.abi.window_service_op_register => blk: {
             state.register_requests +%= 1;
@@ -1838,4 +1850,20 @@ fn replyLink(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Servi
         else => unreachable,
     };
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, std.mem.asBytes(&response));
+}
+
+test "WINSVC maintenance delayed window close and removal reject a replaced owner" {
+    const a = r4os.abi;
+    var state = ServiceState{};
+    var first = a.WindowServiceRecord{ .window_id = 2, .instance_id = 91 };
+    var second = a.WindowServiceRecord{ .window_id = 2, .instance_id = 92 };
+    try std.testing.expectEqual(a.window_service_result_ok, performAction(&state, a.window_service_op_register, std.mem.asBytes(&first)).result);
+    try std.testing.expectEqual(a.window_service_result_ok, performAction(&state, a.window_service_op_remove, std.mem.asBytes(&first)).result);
+    try std.testing.expectEqual(a.window_service_result_ok, performAction(&state, a.window_service_op_register, std.mem.asBytes(&second)).result);
+    for ([_]u16{ a.window_service_op_close, a.window_service_op_update, a.window_service_op_remove }) |op| {
+        try std.testing.expectEqual(a.window_service_result_not_found, performAction(&state, op, std.mem.asBytes(&first)).result);
+    }
+    const slot = state.slots[findSlot(&state, 2).?];
+    try std.testing.expectEqual(second.instance_id, slot.record.instance_id);
+    try std.testing.expectEqual(@as(u32, 0), slot.record.flags & a.window_service_flag_closing);
 }
