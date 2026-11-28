@@ -57,8 +57,8 @@ pub const Broker = struct {
     // producer bookkeeping must not masquerade as another queued image.
     image_revision: u64 = 1,
     serial: u64 = 0,
-    surfaces: [max_surfaces]Surface = .{Surface{}} ** max_surfaces,
-    chains: [max_chains]Chain = .{Chain{}} ** max_chains,
+    surfaces: @import("window_storage.zig").Table(Surface, max_surfaces, .{}) = .{},
+    chains: @import("window_storage.zig").Table(Chain, max_chains, .{}) = .{},
     waiters: [max_waiters]Waiter = .{Waiter{}} ** max_waiters,
 
     pub fn response(self: *const Broker, result: i32) a.WindowGraphicsReply {
@@ -79,18 +79,24 @@ pub const Broker = struct {
         surface.image_revision = self.image_revision;
     }
     fn nativeChains(self: *const Broker, identity: a.WindowGraphicsSurface) bool {
-        for (&self.chains) |*chain| if (chain.id != 0 and !chain.closing and chain.error_result == a.window_graphics_ok and
+        for (self.chains.view()) |*chain| if (chain.id != 0 and !chain.closing and chain.error_result == a.window_graphics_ok and
             sameSurface(chain.surface, identity)) return true;
         return false;
     }
     pub fn imageSnapshot(self: *const Broker, desktop: a.ProgramProcessHandle) markers.Snapshot {
+        return self.imagePage(desktop, 0);
+    }
+    pub fn imagePage(self: *const Broker, desktop: a.ProgramProcessHandle, offset: u32) markers.Snapshot {
+        var skip = offset;
         var value: markers.Snapshot = .{
             .service = .{ .instance = self.service.instance_id, .generation = self.service.generation },
             .desktop = .{ .instance = desktop.instance_id, .generation = desktop.generation },
             .revision = self.image_revision,
         };
-        for (&self.surfaces) |*surface| {
+        for (self.surfaces.view()) |*surface| {
             if (surface.identity.serial == 0 or !owners.sameOwner(surface.identity.desktop, desktop)) continue;
+            if (skip != 0) { skip -= 1; continue; }
+            if (value.count == markers.capacity) break;
             value.rows[value.count] = .{
                 .owner = .{ .instance = surface.identity.owner.instance_id, .generation = surface.identity.owner.generation },
                 .window = surface.identity.window_id, .serial = surface.identity.serial,
@@ -103,14 +109,14 @@ pub const Broker = struct {
     }
     fn findSurface(self: *Broker, identity: a.WindowGraphicsSurface) ?*Surface {
         if (!validHeader(identity) or identity.serial == 0) return null;
-        for (&self.surfaces) |*surface| {
+        for (self.surfaces.items()) |*surface| {
             if (sameSurface(surface.identity, identity)) return surface;
         }
         return null;
     }
     fn findChain(self: *Broker, surface: a.WindowGraphicsSurface, id: u64) ?*Chain {
         if (id == 0) return null;
-        for (&self.chains) |*chain| {
+        for (self.chains.items()) |*chain| {
             if (chain.id == id and sameSurface(chain.surface, surface)) return chain;
         }
         return null;
@@ -135,7 +141,7 @@ pub const Broker = struct {
                 return self.response(a.window_graphics_invalid);
             // A lost create reply may be repeated. Reusing the same window ID
             // after removal still creates a distinct serial.
-            for (&self.surfaces) |*surface| {
+            for (self.surfaces.items()) |*surface| {
                 if (surface.identity.serial != 0 and !surface.removed and surface.identity.window_id == request.window_id and
                     owners.sameOwner(surface.identity.owner, request.owner) and owners.sameOwner(surface.identity.desktop, request.desktop))
                 {
@@ -161,7 +167,7 @@ pub const Broker = struct {
             if (!std.meta.eql(old, new)) {
                 const binding_changed = !std.meta.eql(old.backend.binding, new.backend.binding) or
                     old.backend.memory_generation != new.backend.memory_generation;
-                for (&self.chains) |*chain| {
+                for (self.chains.items()) |*chain| {
                     if (chain.id != 0 and sameSurface(chain.surface, surface.identity))
                         self.invalidate(platform, chain, if (binding_changed) a.window_graphics_device_lost else a.window_graphics_out_of_date);
                 }
@@ -174,16 +180,15 @@ pub const Broker = struct {
             return self.snapshot(surface, a.window_graphics_ok);
         }
         // Removed records with outstanding consumer leases cannot be reused.
-        for (&self.surfaces) |*surface| {
-            if (surface.identity.serial == 0 or (surface.removed and !self.hasChains(surface.identity))) {
-                const id = self.next() orelse return self.response(a.window_graphics_capacity);
-                surface.* = .{ .identity = .{ .service = self.service, .desktop = request.desktop, .owner = request.owner, .window_id = request.window_id, .serial = id }, .config = request.config };
-                self.changed();
-                self.imageChanged(surface);
-                return self.snapshot(surface, a.window_graphics_ok);
-            }
-        }
-        return self.response(a.window_graphics_capacity);
+        const available = for (self.surfaces.items()) |*surface| {
+            if (surface.identity.serial == 0 or (surface.removed and !self.hasChains(surface.identity))) break surface;
+        } else self.surfaces.grow();
+        const surface = available orelse return self.response(a.window_graphics_capacity);
+        const id = self.next() orelse return self.response(a.window_graphics_capacity);
+        surface.* = .{ .identity = .{ .service = self.service, .desktop = request.desktop, .owner = request.owner, .window_id = request.window_id, .serial = id }, .config = request.config };
+        self.changed();
+        self.imageChanged(surface);
+        return self.snapshot(surface, a.window_graphics_ok);
     }
 
     pub fn client(self: *Broker, platform: anytype, request: *const a.WindowGraphicsRequest) a.WindowGraphicsReply {
@@ -195,7 +200,7 @@ pub const Broker = struct {
                 if (!owners.sameOwner(surface.identity.owner, request.owner)) return self.response(a.window_graphics_not_owner);
                 return self.snapshot(surface, if (surface.removed) a.window_graphics_closed else a.window_graphics_ok);
             }
-            for (&self.surfaces) |*surface| {
+            for (self.surfaces.items()) |*surface| {
                 if (!surface.removed and surface.identity.serial != 0 and surface.identity.window_id == request.window_id and
                     owners.sameOwner(surface.identity.owner, request.owner)) return self.snapshot(surface, a.window_graphics_ok);
             }
@@ -246,15 +251,16 @@ pub const Broker = struct {
             if (request.chain != 0 or request.image_count < config.min_images or request.image_count > config.max_images or
                 request.format_index >= config.format_count or (request.present_mode != a.window_graphics_fifo and request.present_mode != a.window_graphics_mailbox) or
                 request.present_mode & config.present_modes == 0) return self.snapshot(surface, a.window_graphics_invalid);
-            for (&self.chains) |*chain| if (chain.id == 0) {
-                const id = self.next() orelse return self.snapshot(surface, a.window_graphics_capacity);
-                chain.* = .{ .id = id, .surface = surface.identity, .config = config, .count = request.image_count, .format = config.formats[request.format_index], .mode = request.present_mode };
-                surface.native = true;
-                self.imageChanged(surface);
-                result.chain = id;
-                return result;
-            };
-            return self.snapshot(surface, a.window_graphics_capacity);
+            const available = for (self.chains.items()) |*chain| {
+                if (chain.id == 0) break chain;
+            } else self.chains.grow();
+            const chain = available orelse return self.snapshot(surface, a.window_graphics_capacity);
+            const id = self.next() orelse return self.snapshot(surface, a.window_graphics_capacity);
+            chain.* = .{ .id = id, .surface = surface.identity, .config = config, .count = request.image_count, .format = config.formats[request.format_index], .mode = request.present_mode };
+            surface.native = true;
+            self.imageChanged(surface);
+            result.chain = id;
+            return result;
         }
         const chain = self.findChain(surface.identity, request.chain) orelse return self.snapshot(surface, a.window_graphics_closed);
         if (chain.closing) return self.snapshot(surface, a.window_graphics_closed);
@@ -296,7 +302,7 @@ pub const Broker = struct {
                     return self.snapshot(surface, a.window_graphics_invalid);
                 // Different import references can still alias the same BO.
                 // Such aliasing would let an app acquire an image under use.
-                for (&self.chains) |*other| {
+                for (self.chains.items()) |*other| {
                     if (other.id == 0) continue;
                     for (other.images[0..other.count]) |image| {
                         if (image.phase != .vacant and std.meta.eql(image.source.buffer, imported.buffer))
@@ -377,7 +383,7 @@ pub const Broker = struct {
             var selected: ?*Chain = null;
             var slot: u32 = 0;
             var order: u64 = std.math.maxInt(u64);
-            for (&self.chains) |*chain| {
+            for (self.chains.items()) |*chain| {
                 if (chain.id == 0 or chain.closing or chain.error_result != a.window_graphics_ok or
                     !sameSurface(chain.surface, surface.identity) or (request.chain != 0 and request.chain != chain.id)) continue;
                 for (chain.images[0..chain.count], 0..) |item, index| {
@@ -515,13 +521,13 @@ pub const Broker = struct {
         };
     }
     fn hasChains(self: *Broker, identity: a.WindowGraphicsSurface) bool {
-        for (&self.chains) |*chain| if (chain.id != 0 and sameSurface(chain.surface, identity)) return true;
+        for (self.chains.items()) |*chain| if (chain.id != 0 and sameSurface(chain.surface, identity)) return true;
         return false;
     }
     fn removeSurface(self: *Broker, platform: anytype, surface: *Surface, consumer_gone: bool) void {
         if (!surface.removed) self.imageChanged(surface);
         surface.removed = true;
-        for (&self.chains) |*chain| {
+        for (self.chains.items()) |*chain| {
             if (chain.id != 0 and sameSurface(chain.surface, surface.identity)) self.closeChain(platform, chain, consumer_gone);
         }
         self.changed();
@@ -529,7 +535,7 @@ pub const Broker = struct {
     /// Dead app: preserve any Desktop lease. Dead Desktop: its own submitted
     /// work is protected by the kernel's existing BO/queue pin lifecycle.
     pub fn removeOwner(self: *Broker, platform: anytype, owner: a.ProgramProcessHandle) void {
-        for (&self.surfaces) |*surface| {
+        for (self.surfaces.items()) |*surface| {
             if (surface.identity.serial == 0) continue;
             const desktop_gone = owners.sameOwner(surface.identity.desktop, owner);
             if ((desktop_gone and (!surface.removed or self.hasChains(surface.identity))) or
@@ -540,14 +546,14 @@ pub const Broker = struct {
         };
     }
     pub fn clear(self: *Broker, platform: anytype) void {
-        for (&self.surfaces) |*surface| {
+        for (self.surfaces.items()) |*surface| {
             if (surface.identity.serial != 0) self.removeSurface(platform, surface, true);
         }
         // Keep identity counters and waiter records: IDs cannot repeat and
         // live waiters must receive the changed/closed result on next drain.
     }
     pub fn participant(self: *const Broker, owner: a.ProgramProcessHandle) bool {
-        for (&self.surfaces) |*surface| {
+        for (self.surfaces.view()) |*surface| {
             if (surface.identity.serial != 0 and !surface.removed and
                 (owners.sameOwner(surface.identity.owner, owner) or owners.sameOwner(surface.identity.desktop, owner))) return true;
         }

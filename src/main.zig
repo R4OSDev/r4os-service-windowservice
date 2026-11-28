@@ -1,4 +1,6 @@
 const std = @import("std");
+const paging = @import("window_list");
+const tables = @import("window_storage.zig");
 const r4os = @import("r4os");
 const tray_broker = @import("tray_broker.zig");
 const desktop_check = @import("desktop_check");
@@ -140,8 +142,8 @@ test "WINSVC maintenance one exact owner is queried once across actual brokers" 
     const owner: r4os.abi.ProgramProcessHandle = .{ .instance_id = 9, .generation = 100 };
     _ = state.tray.bindDesktop(owner);
     state.display.desktop = owner;
-    state.graphics.surfaces[0].identity = .{ .desktop = owner, .owner = owner, .serial = 1 };
-    state.modes.slots[0].identity = .{ .desktop = owner, .owner = owner, .serial = 1 };
+    state.graphics.surfaces.items()[0].identity = .{ .desktop = owner, .owner = owner, .serial = 1 };
+    state.modes.slots.items()[0].identity = .{ .desktop = owner, .owner = owner, .serial = 1 };
     state.next_tray_owner_sweep_tick = 1000;
     SweepProbe.reset();
     maintainTray(&ctx, 1, &state);
@@ -226,15 +228,15 @@ test "WINSVC maintenance many surfaces reuse two owners and removed surfaces kee
     const producer: r4os.abi.ProgramProcessHandle = .{ .instance_id = 10, .generation = 101 };
     _ = state.tray.bindDesktop(desktop);
     state.display.desktop = desktop;
-    for (&state.graphics.surfaces, 0..) |*surface, i| surface.identity = .{ .desktop = desktop, .owner = producer, .serial = i + 1 };
-    for (&state.modes.slots, 0..) |*slot, i| slot.identity = .{ .desktop = desktop, .owner = producer, .serial = i + 1 };
+    for (state.graphics.surfaces.items(), 0..) |*surface, i| surface.identity = .{ .desktop = desktop, .owner = producer, .serial = i + 1 };
+    for (state.modes.slots.items(), 0..) |*slot, i| slot.identity = .{ .desktop = desktop, .owner = producer, .serial = i + 1 };
     state.next_tray_owner_sweep_tick = 1000;
     SweepProbe.reset();
     maintainTray(&ctx, 1, &state);
     try std.testing.expectEqual(@as(usize, 2), SweepProbe.calls);
     state = .{};
-    state.graphics.surfaces[0].identity = .{ .desktop = desktop, .owner = producer, .serial = 1 };
-    state.graphics.surfaces[0].removed = true;
+    state.graphics.surfaces.items()[0].identity = .{ .desktop = desktop, .owner = producer, .serial = 1 };
+    state.graphics.surfaces.items()[0].removed = true;
     state.next_tray_owner_sweep_tick = 1000;
     SweepProbe.reset();
     maintainTray(&ctx, 1, &state);
@@ -295,7 +297,8 @@ const ServiceState = struct {
     bad_ops: u64 = 0,
     bad_requests: u64 = 0,
     last_error: [r4os.abi.window_service_error_bytes]u8 = .{0} ** r4os.abi.window_service_error_bytes,
-    slots: [r4os.abi.window_service_max_windows]Slot = .{Slot{}} ** r4os.abi.window_service_max_windows,
+    slots: tables.Table(Slot, r4os.abi.window_service_max_windows, .{}) = .{},
+    window_revision: u64 = 1,
     tray: tray_broker.Broker = .{},
     desktop_checks: desktop_checks.Queue = .{},
     launches: desktop_launch.Queue = .{},
@@ -416,6 +419,20 @@ fn runService(ctx: *const r4os.r4sys.Context, draw: ?r4os.r4draw.Context, deskto
     }
 
     var state = ServiceState{};
+    state.slots.allocator = ctx.allocator();
+    state.modes.slots.allocator = ctx.allocator();
+    state.graphics.surfaces.allocator = ctx.allocator();
+    state.graphics.chains.allocator = ctx.allocator();
+    state.actions.states.allocator = ctx.allocator();
+    state.actions.candidates.allocator = ctx.allocator();
+    state.actions.focus.allocator = ctx.allocator();
+    defer state.modes.slots.reset();
+    defer state.graphics.surfaces.reset();
+    defer state.graphics.chains.reset();
+    defer state.actions.states.reset();
+    defer state.actions.candidates.reset();
+    defer state.actions.focus.reset();
+    defer state.slots.reset();
     state.graphics_platform.draw = draw;
     state.desktop = desktop;
     // Endpoint identity is not sufficient after service restart. Publish the
@@ -497,7 +514,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.composition_op_capability, r4os.abi.composition_op_focus => replyComposition(ctx, handle, header, state, request),
         r4os.abi.desktop_evidence_op_scope, r4os.abi.desktop_evidence_op_reserve, r4os.abi.desktop_evidence_op_offer, r4os.abi.desktop_evidence_op_ack, r4os.abi.desktop_evidence_op_status, r4os.abi.desktop_evidence_op_read, r4os.abi.desktop_evidence_op_release => replyEvidence(ctx, handle, header, state, request),
         graphics_markers.operation => replyGraphicsMarkers(ctx, handle, header, state, request),
-        launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.complete, launch_wire.received => replyLaunch(ctx, handle, header, state, request),
+        launch_wire.submit, launch_wire.status, launch_wire.wait, launch_wire.status_extended, launch_wire.wait_extended, launch_wire.complete, launch_wire.received => replyLaunch(ctx, handle, header, state, request),
         launch_wire.exchange, r4os.abi.desktop_link_op_exchange => replyTrayDesktop(ctx, handle, header, state, request),
         desktop_check.operation => queueDesktopCheck(ctx, handle, header, state, request),
         desktop_check.tray_operation => replyTrayDesktop(ctx, handle, header, state, request),
@@ -507,6 +524,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceSta
         r4os.abi.window_service_op_text_status,
         => replyTextStatus(ctx, handle, header.request_id, state),
         r4os.abi.window_service_op_status => replyStatus(ctx, handle, header.request_id, state),
+        paging.operation => replyWindowPage(ctx, handle, header.request_id, state, request),
         r4os.abi.window_service_op_snapshot => replySnapshot(ctx, handle, header.request_id, state),
         r4os.abi.window_service_op_register,
         r4os.abi.window_service_op_update,
@@ -566,8 +584,8 @@ fn hasSweepOwners(state: *const ServiceState) bool {
     if (tray_broker.ownerValid(state.tray.desktop_owner) or tray_broker.ownerValid(state.display.desktop)) return true;
     // Removed surfaces can still own chains until the Desktop ends. Their
     // liveness obligation remains; GPU fences are not periodically polled.
-    for (&state.graphics.surfaces) |*surface| if (surface.identity.serial != 0) return true;
-    for (&state.modes.slots) |*slot| if (slot.identity.serial != 0) return true;
+    for (state.graphics.surfaces.view()) |*surface| if (surface.identity.serial != 0) return true;
+    for (state.modes.slots.view()) |*slot| if (slot.identity.serial != 0) return true;
     return state.tray.ownerAt(0) != null;
 }
 
@@ -597,7 +615,7 @@ const OwnerChecks = struct {
             if (entry.owner.instance_id == owner.instance_id and entry.owner.generation == owner.generation and entry.owner.reserved == owner.reserved) return entry.gone;
         }
         const result = processHandleGone(ctx, owner);
-        std.debug.assert(self.count < self.entries.len);
+        if (self.count == self.entries.len) return result;
         self.entries[self.count] = .{ .owner = owner, .gone = result };
         self.count += 1;
         return result;
@@ -621,7 +639,7 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
         if (tray_broker.ownerValid(state.display.desktop) and checks.gone(ctx, state.display.desktop)) state.display.clear();
         // This sweep checks process liveness only. GPU fences are inspected
         // on producer/consumer operations, never periodically polled here.
-        for (&state.graphics.surfaces) |*surface| {
+        for (state.graphics.surfaces.items()) |*surface| {
             if (surface.identity.serial == 0) continue;
             const desktop = surface.identity.desktop;
             const owner = surface.identity.owner;
@@ -629,7 +647,7 @@ fn maintainTray(ctx: *const r4os.r4sys.Context, handle: u32, state: *ServiceStat
             if (!surface.removed and checks.gone(ctx, owner)) state.graphics.removeOwner(&state.graphics_platform, owner);
         }
 
-        for (&state.modes.slots) |*slot| {
+        for (state.modes.slots.items()) |*slot| {
             if (slot.identity.serial == 0) continue;
             const identity = slot.identity;
             if (checks.gone(ctx, identity.desktop)) state.modes.removeOwner(identity.desktop);
@@ -667,11 +685,14 @@ fn replyGraphicsValue(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u
 }
 
 fn replyGraphicsMarkers(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
-    const owner = decodeFixed(r4os.abi.ProgramProcessHandle, payload) orelse
+    const continuation = extern struct { owner: r4os.abi.ProgramProcessHandle, offset: u32, reserved: u32, revision: u64 };
+    const query = decodeFixed(continuation, payload);
+    const owner = if (query) |q| q.owner else decodeFixed(r4os.abi.ProgramProcessHandle, payload) orelse
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
-    if (desktopCaller(ctx, header.client_id, owner, state) == null)
+    if (desktopCaller(ctx, header.client_id, owner, state) == null or
+        (query != null and (query.?.reserved != 0 or query.?.offset == 0 or query.?.revision == 0)))
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
-    const snapshot = state.graphics.imageSnapshot(owner);
+    const snapshot = state.graphics.imagePage(owner, if (query) |q| q.offset else 0);
     var bytes: [graphics_markers.size]u8 = undefined;
     graphics_markers.encode(&bytes, &snapshot);
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, &bytes);
@@ -875,9 +896,10 @@ fn replyLaunchValue(ctx: *const r4os.r4sys.Context, handle: u32, rpc: u32, value
     return r4os.app_services.replyIfPending(ctx.*, handle, rpc, 0, &bytes);
 }
 fn replyLaunch(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.ServiceMessageHeader, state: *ServiceState, payload: []const u8) i32 {
-    const request = launch_wire.decode(payload) catch
+    var request = launch_wire.decode(payload) catch
         return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, r4os.abi.service_api_result_invalid, "");
     const now = ctx.ticks();
+    request.extended_reply = header.op == launch_wire.status_extended or header.op == launch_wire.wait_extended;
     const value = switch (header.op) {
         launch_wire.submit => blk: {
             if (liveCaller(ctx, header.client_id, launchHandle(request.request)) == null or
@@ -891,8 +913,8 @@ fn replyLaunch(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Ser
             }
             break :blk accepted;
         },
-        launch_wire.status => state.launches.status(request),
-        launch_wire.wait => blk: {
+        launch_wire.status, launch_wire.status_extended => state.launches.status(request),
+        launch_wire.wait, launch_wire.wait_extended => blk: {
             if (request.deadline > now +| ctx.ticksFromMilliseconds(300000)) break :blk state.launches.rejected(request, .invalid);
             break :blk state.launches.beginWait(request, header.request_id, now) orelse return 0;
         },
@@ -909,7 +931,7 @@ fn replyLaunch(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Ser
         },
         else => unreachable,
     };
-    return replyLaunchValue(ctx, handle, header.request_id, value);
+    return replyLaunchValue(ctx, handle, header.request_id, launch_wire.clientReply(value, request.extended_reply));
 }
 
 fn checkIdentity(value: r4os.abi.ProgramProcessHandle) desktop_check.Identity {
@@ -1067,8 +1089,8 @@ fn replyDesktopWindow(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.
                     if (extended) |v| {
                         var focus = v.focus;
                         if (focus.window.serial == 0) focus.window = response.mode.identity;
-                        if (!state.actions.publishFocus(focus) and response.mode.identity.window_id < state.actions.focus.len) {
-                            state.actions.focus[response.mode.identity.window_id] = .{};
+                        if (!state.actions.publishFocus(focus) and response.mode.identity.window_id < state.actions.focus.items().len) {
+                            state.actions.focus.items()[response.mode.identity.window_id] = .{};
                             state.actions.invalidateCompositionFocus(response.mode.identity);
                         }
                     }
@@ -1245,8 +1267,46 @@ fn replyDesktopDiagnostics(ctx: *const r4os.r4sys.Context, handle: u32, request_
     return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes);
 }
 
+fn windowPage(state: *const ServiceState, q: paging.Query) paging.Page(r4os.abi) {
+    const scope = state.graphics.service;
+    var out = paging.Page(r4os.abi){ .revision = state.window_revision, .service = scope.instance_id,
+        .generation = scope.generation, .status = makeStatus(state) };
+    if (q.version != 1 or q.size != @sizeOf(paging.Query) or q.reserved != 0 or q.limit == 0 or q.limit > paging.capacity or
+        (q.cursor == 0 and (q.revision != 0 or q.service != 0 or q.generation != 0))) {
+        out.result = paging.invalid;
+        return out;
+    }
+    if (q.cursor != 0 and (q.revision != out.revision or q.service != out.service or q.generation != out.generation or
+        q.revision == std.math.maxInt(u64))) {
+        out.result = paging.restart;
+        return out;
+    }
+    const slots = state.slots.view();
+    if (q.cursor > slots.len) { out.result = paging.invalid; return out; }
+    for (slots[q.cursor..], q.cursor..) |slot, i| {
+        if (!slot.used) continue;
+        if (out.count == q.limit) { out.next = @intCast(i); break; }
+        out.records[out.count] = slot.record;
+        out.count += 1;
+    }
+    return out;
+}
+
+fn replyWindowPage(ctx: *const r4os.r4sys.Context, handle: u32, rpc: u32, state: *ServiceState, request: []const u8) i32 {
+    const q = decodeFixed(paging.Query, request) orelse
+        return r4os.app_services.replyIfPending(ctx.*, handle, rpc, r4os.abi.service_api_result_invalid, "PAGEBAD");
+    const page = windowPage(state, q);
+    return r4os.app_services.replyIfPending(ctx.*, handle, rpc, r4os.abi.service_api_result_ok, std.mem.asBytes(&page));
+}
+
+fn legacySnapshotStatus(state: *const ServiceState) i32 {
+    return if (windowCount(state) <= r4os.abi.window_service_max_windows) r4os.abi.service_api_result_ok else r4os.abi.service_api_result_buffer_too_small;
+}
+
 fn replySnapshot(ctx: *const r4os.r4sys.Context, handle: u32, request_id: u32, state: *ServiceState) i32 {
     state.snapshot_requests +%= 1;
+    if (legacySnapshotStatus(state) != r4os.abi.service_api_result_ok)
+        return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_buffer_too_small, "WINDOW_LIST_PAGED");
     snapshot_reply = makeSnapshot(state);
     const bytes: [*]const u8 = @ptrCast(&snapshot_reply);
     return r4os.app_services.replyIfPending(ctx.*, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.WindowServiceSnapshot)]);
@@ -1265,7 +1325,7 @@ fn performAction(state: *ServiceState, op: u16, request: []const u8) r4os.abi.Wi
         if (requestRecord(request)) |record| {
             if (record.instance_id != 0) {
                 if (findSlot(state, record.window_id)) |i| {
-                    if (state.slots[i].record.instance_id != record.instance_id)
+                    if (state.slots.items()[i].record.instance_id != record.instance_id)
                         return failResult(state, op, r4os.abi.window_service_result_not_found, "stale-window");
                 }
             }
@@ -1335,60 +1395,60 @@ fn performAction(state: *ServiceState, op: u16, request: []const u8) r4os.abi.Wi
 fn upsertRecord(state: *ServiceState, op: u16, raw: r4os.abi.WindowServiceRecord, create: bool, focus: bool) r4os.abi.WindowServiceResult {
     var record = sanitizeRecord(raw);
     if (findSlot(state, record.window_id)) |index| {
-        const old_z = state.slots[index].record.z_order;
+        const old_z = state.slots.items()[index].record.z_order;
         if (record.z_order == 0) record.z_order = old_z;
-        state.slots[index].record = record;
+        state.slots.items()[index].record = record;
         if ((record.flags & r4os.abi.window_service_flag_focused) != 0 or focus) focusRecordAt(state, index);
         noteChange(state, "ok");
-        return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots[index].record, "ok");
+        return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots.items()[index].record, "ok");
     }
     if (!create) return failResult(state, op, r4os.abi.window_service_result_not_found, "not-found");
     const free = findFreeSlot(state) orelse return failResult(state, op, r4os.abi.window_service_result_full, "full");
     if (record.z_order == 0) record.z_order = nextZ(state);
-    state.slots[free] = .{ .used = true, .record = record };
+    state.slots.items()[free] = .{ .used = true, .record = record };
     if ((record.flags & r4os.abi.window_service_flag_focused) != 0 or focus) focusRecordAt(state, free);
     noteChange(state, "ok");
-    return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots[free].record, "ok");
+    return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots.items()[free].record, "ok");
 }
 
 fn focusRecord(state: *ServiceState, op: u16, window_id: u32) r4os.abi.WindowServiceResult {
     const index = findSlot(state, window_id) orelse return failResult(state, op, r4os.abi.window_service_result_not_found, "not-found");
     focusRecordAt(state, index);
     noteChange(state, "ok");
-    return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots[index].record, "ok");
+    return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots.items()[index].record, "ok");
 }
 
 fn focusRecordAt(state: *ServiceState, index: usize) void {
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (!state.slots[i].used) continue;
-        state.slots[i].record.flags &= ~r4os.abi.window_service_flag_focused;
+    while (i < state.slots.items().len) : (i += 1) {
+        if (!state.slots.items()[i].used) continue;
+        state.slots.items()[i].record.flags &= ~r4os.abi.window_service_flag_focused;
     }
-    state.slots[index].record.flags |= r4os.abi.window_service_flag_visible | r4os.abi.window_service_flag_focused;
-    state.slots[index].record.flags &= ~r4os.abi.window_service_flag_minimized;
-    state.slots[index].record.z_order = nextZ(state);
+    state.slots.items()[index].record.flags |= r4os.abi.window_service_flag_visible | r4os.abi.window_service_flag_focused;
+    state.slots.items()[index].record.flags &= ~r4os.abi.window_service_flag_minimized;
+    state.slots.items()[index].record.z_order = nextZ(state);
 }
 
 fn setRecordFlag(state: *ServiceState, op: u16, window_id: u32, flag: u32, enabled: bool, visible: bool) r4os.abi.WindowServiceResult {
     const index = findSlot(state, window_id) orelse return failResult(state, op, r4os.abi.window_service_result_not_found, "not-found");
     if (enabled) {
-        state.slots[index].record.flags |= flag;
+        state.slots.items()[index].record.flags |= flag;
     } else {
-        state.slots[index].record.flags &= ~flag;
+        state.slots.items()[index].record.flags &= ~flag;
     }
-    if (visible) state.slots[index].record.flags |= r4os.abi.window_service_flag_visible;
+    if (visible) state.slots.items()[index].record.flags |= r4os.abi.window_service_flag_visible;
     if (flag == r4os.abi.window_service_flag_minimized and enabled) {
-        state.slots[index].record.flags &= ~r4os.abi.window_service_flag_focused;
+        state.slots.items()[index].record.flags &= ~r4os.abi.window_service_flag_focused;
         selectFallbackFocus(state);
     }
     noteChange(state, "ok");
-    return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots[index].record, "ok");
+    return makeResult(state, op, r4os.abi.window_service_result_ok, &state.slots.items()[index].record, "ok");
 }
 
 fn removeRecord(state: *ServiceState, op: u16, window_id: u32) r4os.abi.WindowServiceResult {
     const index = findSlot(state, window_id) orelse return failResult(state, op, r4os.abi.window_service_result_not_found, "not-found");
-    const old = state.slots[index].record;
-    state.slots[index] = .{};
+    const old = state.slots.items()[index].record;
+    state.slots.items()[index] = .{};
     selectFallbackFocus(state);
     noteChange(state, "ok");
     return makeResult(state, op, r4os.abi.window_service_result_ok, &old, "ok");
@@ -1397,10 +1457,10 @@ fn removeRecord(state: *ServiceState, op: u16, window_id: u32) r4os.abi.WindowSe
 fn sweepStale(state: *ServiceState) u32 {
     var removed: u32 = 0;
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (!state.slots[i].used) continue;
-        if (state.slots[i].record.instance_id != 0) continue;
-        state.slots[i] = .{};
+    while (i < state.slots.items().len) : (i += 1) {
+        if (!state.slots.items()[i].used) continue;
+        if (state.slots.items()[i].record.instance_id != 0) continue;
+        state.slots.items()[i] = .{};
         removed += 1;
     }
     if (removed != 0) {
@@ -1414,8 +1474,7 @@ fn clearAll(state: *ServiceState, reason: []const u8) void {
     state.display.clear();
     state.modes.clear();
     state.graphics.clear(&state.graphics_platform);
-    var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) state.slots[i] = .{};
+    state.slots.reset();
     state.next_z = 1;
     noteChange(state, reason);
     notifyDesktop(state);
@@ -1425,17 +1484,17 @@ fn selectFallbackFocus(state: *ServiceState) void {
     var best: ?usize = null;
     var best_z: u32 = 0;
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (!state.slots[i].used) continue;
-        state.slots[i].record.flags &= ~r4os.abi.window_service_flag_focused;
-        const flags = state.slots[i].record.flags;
+    while (i < state.slots.items().len) : (i += 1) {
+        if (!state.slots.items()[i].used) continue;
+        state.slots.items()[i].record.flags &= ~r4os.abi.window_service_flag_focused;
+        const flags = state.slots.items()[i].record.flags;
         if ((flags & r4os.abi.window_service_flag_visible) == 0 or (flags & r4os.abi.window_service_flag_minimized) != 0) continue;
-        if (best == null or state.slots[i].record.z_order >= best_z) {
+        if (best == null or state.slots.items()[i].record.z_order >= best_z) {
             best = i;
-            best_z = state.slots[i].record.z_order;
+            best_z = state.slots.items()[i].record.z_order;
         }
     }
-    if (best) |index| state.slots[index].record.flags |= r4os.abi.window_service_flag_focused;
+    if (best) |index| state.slots.items()[index].record.flags |= r4os.abi.window_service_flag_focused;
 }
 
 fn requestRecord(request: []const u8) ?r4os.abi.WindowServiceRecord {
@@ -1470,7 +1529,7 @@ fn makeStatus(state: *const ServiceState) r4os.abi.WindowServiceStatus {
     var out = r4os.abi.WindowServiceStatus{
         .revision = state.revision,
         .window_count = windowCount(state),
-        .max_windows = r4os.abi.window_service_max_windows,
+        .max_windows = @intCast(state.slots.view().len),
         .next_z = state.next_z,
         .requests = state.requests,
         .status_requests = state.status_requests,
@@ -1489,11 +1548,11 @@ fn makeStatus(state: *const ServiceState) r4os.abi.WindowServiceStatus {
         .bad_requests = state.bad_requests,
     };
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (!state.slots[i].used) continue;
-        if ((state.slots[i].record.flags & r4os.abi.window_service_flag_focused) == 0) continue;
-        out.focused_window = state.slots[i].record.window_id;
-        out.focused_instance = state.slots[i].record.instance_id;
+    while (i < state.slots.view().len) : (i += 1) {
+        if (!state.slots.view()[i].used) continue;
+        if ((state.slots.view()[i].record.flags & r4os.abi.window_service_flag_focused) == 0) continue;
+        out.focused_window = state.slots.view()[i].record.window_id;
+        out.focused_instance = state.slots.view()[i].record.instance_id;
         break;
     }
     copyFixed(out.last_error[0..], spanZ(state.last_error[0..]));
@@ -1506,9 +1565,9 @@ fn makeSnapshot(state: *const ServiceState) r4os.abi.WindowServiceSnapshot {
     };
     var src: usize = 0;
     var dst: usize = 0;
-    while (src < state.slots.len and dst < out.records.len) : (src += 1) {
-        if (!state.slots[src].used) continue;
-        out.records[dst] = state.slots[src].record;
+    while (src < state.slots.view().len and dst < out.records.len) : (src += 1) {
+        if (!state.slots.view()[src].used) continue;
+        out.records[dst] = state.slots.view()[src].record;
         dst += 1;
     }
     return out;
@@ -1537,6 +1596,7 @@ fn failResult(state: *ServiceState, action: u16, result: i32, last: []const u8) 
 
 fn noteChange(state: *ServiceState, last: []const u8) void {
     state.revision +%= 1;
+    state.window_revision +|= 1;
     setLastError(state, last);
 }
 
@@ -1546,25 +1606,27 @@ fn setLastError(state: *ServiceState, value: []const u8) void {
 
 fn findSlot(state: *const ServiceState, window_id: u32) ?usize {
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (state.slots[i].used and state.slots[i].record.window_id == window_id) return i;
+    while (i < state.slots.view().len) : (i += 1) {
+        if (state.slots.view()[i].used and state.slots.view()[i].record.window_id == window_id) return i;
     }
     return null;
 }
 
-fn findFreeSlot(state: *const ServiceState) ?usize {
+fn findFreeSlot(state: *ServiceState) ?usize {
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (!state.slots[i].used) return i;
+    while (i < state.slots.view().len) : (i += 1) {
+        if (!state.slots.view()[i].used) return i;
     }
-    return null;
+    const index = state.slots.view().len;
+    _ = state.slots.grow() orelse return null;
+    return index;
 }
 
 fn windowCount(state: *const ServiceState) u32 {
     var count: u32 = 0;
     var i: usize = 0;
-    while (i < state.slots.len) : (i += 1) {
-        if (state.slots[i].used) count += 1;
+    while (i < state.slots.view().len) : (i += 1) {
+        if (state.slots.view()[i].used) count += 1;
     }
     return count;
 }
@@ -1852,6 +1914,37 @@ fn replyLink(ctx: *const r4os.r4sys.Context, handle: u32, header: r4os.abi.Servi
     return r4os.app_services.replyIfPending(ctx.*, handle, header.request_id, 0, std.mem.asBytes(&response));
 }
 
+test "WINSVC maintenance pages cover a growing catalogue and restart on mutation" {
+    const a = r4os.abi;
+    var state: ServiceState = .{};
+    state.slots.allocator = std.testing.allocator;
+    defer state.slots.reset();
+    state.graphics.service = .{ .instance_id = 9, .generation = 27 };
+    for (0..20) |i| {
+        var record: a.WindowServiceRecord = .{ .window_id = @intCast(i), .instance_id = @intCast(100 + i) };
+        try std.testing.expectEqual(a.window_service_result_ok, performAction(&state, a.window_service_op_register, std.mem.asBytes(&record)).result);
+    }
+    var q: paging.Query = .{};
+    var n: usize = 0;
+    while (true) {
+        const page = windowPage(&state, q);
+        try std.testing.expectEqual(paging.ok, page.result);
+        try std.testing.expectEqual(@as(u32, 20), page.status.window_count);
+        for (page.records[0..page.count]) |r| {
+            try std.testing.expectEqual(@as(u32, @intCast(n + 100)), r.instance_id);
+            n += 1;
+        }
+        if (page.next == 0) break;
+        q = .{ .cursor = page.next, .service = page.service, .generation = page.generation, .revision = page.revision };
+    }
+    try std.testing.expectEqual(@as(usize, 20), n);
+    _ = removeRecord(&state, a.window_service_op_remove, 11);
+    try std.testing.expectEqual(paging.restart, windowPage(&state, q).result);
+    try std.testing.expectEqual(r4os.abi.service_api_result_buffer_too_small, legacySnapshotStatus(&state));
+    state.slots.reset();
+    try std.testing.expectEqual(r4os.abi.service_api_result_ok, legacySnapshotStatus(&state));
+}
+
 test "WINSVC maintenance delayed window close and removal reject a replaced owner" {
     const a = r4os.abi;
     var state = ServiceState{};
@@ -1863,7 +1956,7 @@ test "WINSVC maintenance delayed window close and removal reject a replaced owne
     for ([_]u16{ a.window_service_op_close, a.window_service_op_update, a.window_service_op_remove }) |op| {
         try std.testing.expectEqual(a.window_service_result_not_found, performAction(&state, op, std.mem.asBytes(&first)).result);
     }
-    const slot = state.slots[findSlot(&state, 2).?];
+    const slot = state.slots.items()[findSlot(&state, 2).?];
     try std.testing.expectEqual(second.instance_id, slot.record.instance_id);
     try std.testing.expectEqual(@as(u32, 0), slot.record.flags & a.window_service_flag_closing);
 }

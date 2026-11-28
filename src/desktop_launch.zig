@@ -158,7 +158,7 @@ pub const Queue = struct {
             if (!value.done() and now < waiter.deadline) continue;
             if (!value.done()) value = self.rejected(value, .timeout);
             waiter.used = false;
-            return .{ .rpc = waiter.rpc, .value = value };
+            return .{ .rpc = waiter.rpc, .value = w.clientReply(value, waiter.key.extended_reply) };
         }
         return null;
     }

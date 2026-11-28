@@ -71,7 +71,9 @@ test "delegated grant requires the real live launch requester and exact named co
     try t.expectEqual(@as(u32, 1), mapped_grant.request.token.window.window_id);
     try t.expectEqual(@as(i32, -1), w.windowIdFromLaunchReceipt(0));
     try t.expectEqual(@as(i32, 3), w.windowIdFromLaunchReceipt(4));
-    try t.expectEqual(@as(i32, -1), w.windowIdFromLaunchReceipt(5));
+    try t.expectEqual(@as(i32, 4), w.windowIdFromLaunchReceipt(5));
+    try t.expectEqual(@as(i32, 0x7fffffff), w.windowIdFromLaunchReceipt(0x80000000));
+    try t.expectEqual(@as(i32, -1), w.windowIdFromLaunchReceipt(0x80000001));
 }
 test "offered timeout stays unknown and a late immutable original receipt resolves it without reapply" {
     var b = broker();

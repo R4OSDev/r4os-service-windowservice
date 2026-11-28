@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const active_path = b.dependency("r4os_r4desk", .{ .@"contract-only" = true }).path("Contract/desktop_check_v2.zig");
     const active_wire = b.createModule(.{ .root_source_file = active_path, .target = b.graph.host });
     _ = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{
-        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path, b.path("Contract/desktop_launch_v1.zig"), b.path("Contract/desktop_graphics_v1.zig") },
+        .zig_module_roots = &.{ b.path("Contract/desktop_diagnostics_v1.zig"), active_path, b.path("Contract/desktop_launch_v1.zig"), b.path("Contract/window_list_v1.zig"), b.path("Contract/desktop_graphics_v1.zig") },
     });
 
     const tray_broker_module = b.createModule(.{
@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
 
     // Exercise the actual service maintenance adapter and its real brokers.
     const maintenance_root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host });
+    maintenance_root.addImport("window_list", b.createModule(.{ .root_source_file = b.path("Contract/window_list_v1.zig"), .target = b.graph.host }));
     maintenance_root.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
     maintenance_root.addImport("desktop_check", active_wire);
     maintenance_root.addImport("desktop_diagnostics", wire);

@@ -28,21 +28,21 @@ pub const Broker = struct {
     service: a.ProgramProcessHandle = .{},
     serial: u64 = 0,
     revision: u64 = 1,
-    slots: [a.window_service_max_windows]Slot = @splat(.{}),
+    slots: @import("window_storage.zig").Table(Slot, a.window_service_max_windows, .{}) = .{},
 
     pub fn clear(self: *Broker) void {
-        for (&self.slots) |*slot| slot.* = .{};
+        self.slots.reset();
         self.revision +|= 1;
     }
     pub fn removeOwner(self: *Broker, owner: a.ProgramProcessHandle) void {
-        for (&self.slots) |*slot| if (slot.identity.serial != 0 and
+        for (self.slots.items()) |*slot| if (slot.identity.serial != 0 and
             (owners.sameOwner(slot.identity.owner, owner) or owners.sameOwner(slot.identity.desktop, owner))) {
             slot.* = .{};
             self.revision +|= 1;
         };
     }
     fn find(self: *Broker, identity: a.WindowModeIdentity) ?*Slot {
-        for (&self.slots) |*slot| if (slot.identity.serial != 0 and slot.identity.window_id == identity.window_id and
+        for (self.slots.items()) |*slot| if (slot.identity.serial != 0 and slot.identity.window_id == identity.window_id and
             owners.sameOwner(slot.identity.owner, identity.owner)) return slot;
         return null;
     }
@@ -88,7 +88,8 @@ pub const Broker = struct {
         };
         if (found == null) {
             if (!owners.ownerValid(self.service) or self.serial == std.math.maxInt(u64)) return .{ .result = unavailable };
-            for (&self.slots) |*slot| if (slot.identity.serial == 0) { found = slot; break; };
+            for (self.slots.items()) |*slot| if (slot.identity.serial == 0) { found = slot; break; };
+            if (found == null) found = self.slots.grow();
             const slot = found orelse return .{ .result = busy };
             self.serial += 1;
             slot.* = .{ .identity = .{ .service = self.service, .desktop = request.identity.desktop,

@@ -30,7 +30,7 @@ pub const Error = error{ InvalidSnapshot, InvalidProtocol, BufferTooSmall };
 
 fn valid(s: Snapshot) bool {
     if (s.flags & ~@as(u32, 7) != 0 or s.service_instance == 0 or s.service_generation == 0 or
-        s.endpoint == 0 or s.window_count > 64 or s.logical_outputs > 8) return false;
+        s.endpoint == 0 or s.logical_outputs > 8) return false;
     if (s.flags & owner_valid != 0) {
         if (s.desktop_instance == 0 or s.desktop_generation == 0 or s.desktop_epoch != s.desktop_generation) return false;
     } else if (s.desktop_instance != 0 or s.desktop_generation != 0 or s.desktop_epoch != 0 or s.flags & display_valid != 0) return false;

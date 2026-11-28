@@ -10,6 +10,9 @@ pub const complete: u16 = 4740;
 // Desktop retained the exact execution receipt. This is no process/frame
 // result and cannot settle or retire a possibly still-running loader.
 pub const received: u16 = 4741;
+// Read-only operations negotiate window values beyond the legacy four.
+pub const status_extended: u16 = 4742;
+pub const wait_extended: u16 = 4743;
 pub const size = 448;
 pub const magic: u32 = 0x314c4452; // RDL1
 pub const wait_frame: u32 = 1;
@@ -47,6 +50,7 @@ pub const Identity = struct {
     }
 };
 pub const Message = struct {
+    extended_reply: bool = false, // RPC negotiation, not part of the 448 wire bytes
     broker: Identity = .{},
     request: Identity = .{},
     desktop: Identity = .{},
@@ -131,7 +135,7 @@ pub fn decode(bytes: []const u8) !Message {
         .raw = get(bytes, 100, i32),
         .content = get(bytes, 104, u64),
     };
-    if (m.flags & ~@as(u32, 15) != 0 or m.policy > 2 or m.window > 4) return error.InvalidWire;
+    if (m.flags & ~@as(u32, 15) != 0 or m.policy > 2 or m.window > @as(u32, std.math.maxInt(i32)) + 1) return error.InvalidWire;
     @memcpy(&m.path, bytes[112..272]);
     @memcpy(&m.args, bytes[272..400]);
     @memcpy(&m.title, bytes[400..448]);
@@ -141,4 +145,25 @@ pub fn decode(bytes: []const u8) !Message {
         for (field[n..]) |b| if (b != 0) return error.InvalidWire;
     }
     return m;
+}
+
+pub fn clientReply(value: Message, extended: bool) Message {
+    if (extended or value.window <= 4) return value;
+    var result = value;
+    result.phase = if (result.process.valid()) .process else .starting;
+    result.code = .attachment;
+    result.raw = -6; // legacy receiver cannot represent the window
+    result.content = 0;
+    result.window = 0;
+    result.flags |= terminal;
+    return result;
+}
+
+test "legacy launch receipt keeps the exact process when its window cannot be represented" {
+    const current = Message{ .phase = .content, .window = 20, .process = .{ .instance = 7, .generation = 14 }, .content = 9 };
+    var bytes: [size]u8 = undefined;
+    encode(&bytes, clientReply(current, true));
+    try std.testing.expectEqual(@as(u32, 20), (try decode(&bytes)).window);
+    const legacy = clientReply(current, false);
+    try std.testing.expect(legacy.done() and legacy.code == .attachment and legacy.window == 0 and legacy.process.eql(current.process));
 }

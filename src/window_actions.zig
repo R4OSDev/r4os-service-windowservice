@@ -10,7 +10,7 @@ pub const State = a.DesktopActionState;
 /// Legacy launch receipts use slot + 1 (zero means none). Native GUI/mode
 /// identities use the zero-based slot. Preserve that protocol boundary.
 pub fn windowIdFromLaunchReceipt(receipt: u32) i32 {
-    if (receipt == 0 or receipt > 4) return -1;
+    if (receipt == 0 or receipt - 1 > std.math.maxInt(i32)) return -1;
     return @intCast(receipt - 1);
 }
 pub const Launch = struct { request: Handle, owner: Handle = .{}, desktop: Handle = .{}, window_id: i32 = -1, deadline: u64 = 0 };
@@ -79,9 +79,9 @@ pub const Broker = struct {
     serial: u64 = 0,
     revision: u64 = 1,
     slots: [a.desktop_action_max_grants]Slot = @splat(.{}),
-    states: [a.window_service_max_windows]State = @splat(.{}),
-    candidates: [a.window_service_max_windows]u64 = @splat(0),
-    focus: [a.window_service_max_windows]a.DesktopFocusSnapshot = @splat(.{}),
+    states: @import("window_storage.zig").Table(State, a.window_service_max_windows, .{}) = .{},
+    candidates: @import("window_storage.zig").Table(u64, a.window_service_max_windows, 0) = .{},
+    focus: @import("window_storage.zig").Table(a.DesktopFocusSnapshot, a.window_service_max_windows, .{}) = .{},
     // A derived acknowledgement from this same original window/focus owner,
     // not another window registry. Input revision is freshness, not focus ID.
     composition_focus: a.CompositionFocus = .{},
@@ -109,9 +109,9 @@ pub const Broker = struct {
         return null;
     }
     fn current(self: *const Broker, identity: a.WindowModeIdentity) State {
-        for (self.states, 0..) |s, i| if (identity.serial != 0 and sameWindow(identity, s.window)) {
+        for (self.states.view(), 0..) |s, i| if (identity.serial != 0 and sameWindow(identity, s.window)) {
             var value = s;
-            value.candidate_generation = self.candidates[i];
+            value.candidate_generation = self.candidates.view()[i];
             if (value.candidate_generation != 0) value.proof_flags |= a.desktop_action_proof_app_ack;
             return value;
         };
@@ -146,7 +146,7 @@ pub const Broker = struct {
         var pointer_input: u64 = 0;
         if (token.rights == a.desktop_action_right_pointer) {
             if (now == 0 or duration == 0 or !valid(launch.owner) or !valid(launch.desktop) or launch.window_id < 0) return reject(token, a.desktop_action_result_unavailable);
-            for (self.states) |state| if (state.window.serial != 0 and same(state.window.owner, launch.owner) and
+            for (self.states.items()) |state| if (state.window.serial != 0 and same(state.window.owner, launch.owner) and
                 same(state.window.desktop, launch.desktop) and state.window.window_id == @as(u32, @intCast(launch.window_id)))
             {
                 pointer_state = state;
@@ -154,7 +154,7 @@ pub const Broker = struct {
             };
             const state = pointer_state orelse return reject(token, a.desktop_action_result_pending);
             if (state.input_revision == 0 or state.info.flags & 1 == 0 or state.info.flags & 2 != 0) return reject(token, a.desktop_action_result_unavailable);
-            const focus = self.focus[state.window.window_id];
+            const focus = self.focus.items()[state.window.window_id];
             if (!sameWindow(focus.window, state.window) or focus.view_revision != state.view_revision or
                 focus.focus_state != a.desktop_focus_state_focused or focus.input_revision == 0 or
                 now < focus.observed_tick or now - focus.observed_tick > duration / 2)
@@ -187,7 +187,7 @@ pub const Broker = struct {
     }
     fn bindKnown(self: *Broker, slot: *Slot) void {
         if (slot.token.window.serial != 0 or !valid(slot.launch.owner) or slot.phase == a.desktop_action_phase_ended or slot.phase == a.desktop_action_phase_released) return;
-        for (self.states) |state| if (state.window.serial != 0 and same(state.window.owner, slot.launch.owner) and
+        for (self.states.items()) |state| if (state.window.serial != 0 and same(state.window.owner, slot.launch.owner) and
             same(state.window.desktop, slot.launch.desktop) and @as(i64, state.window.window_id) == slot.launch.window_id)
         {
             slot.token.window = state.window;
@@ -204,10 +204,10 @@ pub const Broker = struct {
     pub fn removeWindow(self: *Broker, identity: a.WindowModeIdentity) void {
         if (identity.serial == 0) return;
         self.invalidateCompositionFocus(identity);
-        for (&self.states, 0..) |*s, i| if (sameWindow(s.window, identity)) {
+        for (self.states.items(), 0..) |*s, i| if (sameWindow(s.window, identity)) {
             s.* = .{};
-            self.candidates[i] = 0;
-            self.focus[i] = .{};
+            self.candidates.items()[i] = 0;
+            self.focus.items()[i] = .{};
         };
         for (&self.slots) |*s| if (s.used and sameWindow(s.token.window, identity)) {
             s.ended = true;
@@ -220,13 +220,16 @@ pub const Broker = struct {
     /// the original mode broker accepted the exact published incarnation.
     pub fn publish(self: *Broker, state: State) bool {
         if (state.version != 1 or state.size != @sizeOf(State) or state.reserved != 0 or state.window.serial == 0 or
-            !same(state.window.service, self.service) or state.window.window_id >= self.states.len or state.view_revision == 0 or
+            !same(state.window.service, self.service) or state.window.window_id > std.math.maxInt(i32) or state.view_revision == 0 or
             state.input_revision != state.view_revision or state.info.window_id != @as(i32, @intCast(state.window.window_id))) return false;
+        const needed = @as(usize, state.window.window_id) + 1;
+        // The states length is the published bound. Grow sidecars first.
+        if (!self.candidates.ensure(needed) or !self.focus.ensure(needed) or !self.states.ensure(needed)) return false;
         const i = state.window.window_id;
-        const old = self.states[i];
+        const old = self.states.items()[i];
         const same_window = sameWindow(old.window, state.window);
         if (same_window and state.view_revision < old.view_revision) return false;
-        const candidate = if (same_window and state.view_revision == old.view_revision) self.candidates[i] else 0;
+        const candidate = if (same_window and state.view_revision == old.view_revision) self.candidates.items()[i] else 0;
         if (state.proof_flags & ~@as(u32, 63) != 0 or state.proof_flags & a.desktop_action_proof_view == 0) return false;
         if (state.proof_flags & a.desktop_action_proof_composed != 0 and state.composition_serial == 0) return false;
         if (state.proof_flags & a.desktop_action_proof_app_fresh != 0 and
@@ -234,10 +237,10 @@ pub const Broker = struct {
         if (state.proof_flags & a.desktop_action_proof_invisible != 0 and (state.info.flags & 2 == 0 or state.frame_generation != 0)) return false;
         // Validate the entire copied publication before mutating the old view.
         if (!same_window and old.window.serial != 0) self.removeWindow(old.window);
-        if (!same_window or state.view_revision != old.view_revision) self.candidates[i] = 0;
-        self.states[i] = state;
-        self.states[i].candidate_generation = 0;
-        self.states[i].proof_flags &= ~@as(u32, a.desktop_action_proof_app_ack);
+        if (!same_window or state.view_revision != old.view_revision) self.candidates.items()[i] = 0;
+        self.states.items()[i] = state;
+        self.states.items()[i].candidate_generation = 0;
+        self.states.items()[i].proof_flags &= ~@as(u32, a.desktop_action_proof_app_ack);
         for (&self.slots) |*s| if (s.used) self.bindKnown(s);
         return true;
     }
@@ -245,21 +248,21 @@ pub const Broker = struct {
     /// this copied sidecar uses the same exact window and view revision.
     pub fn publishFocus(self: *Broker, snapshot: a.DesktopFocusSnapshot) bool {
         if (snapshot.version != 1 or snapshot.size != @sizeOf(a.DesktopFocusSnapshot) or snapshot.reserved != 0 or
-            snapshot.window.window_id >= self.states.len or snapshot.window.serial == 0 or
+            snapshot.window.window_id >= self.states.items().len or snapshot.window.serial == 0 or
             snapshot.input_revision == 0 or snapshot.observed_tick == 0 or
             snapshot.focus_state > a.desktop_focus_state_focused or snapshot.flags & ~@as(u32, 3) != 0)
             return false;
         const index = snapshot.window.window_id;
-        const view = self.states[index];
+        const view = self.states.items()[index];
         if (!sameWindow(view.window, snapshot.window) or view.view_revision != snapshot.view_revision or
             snapshot.flags != (view.info.flags & 3) or
             (snapshot.focus_state == a.desktop_focus_state_focused and (snapshot.flags & 1 == 0 or snapshot.flags & 2 != 0))) return false;
-        const previous = self.focus[index];
+        const previous = self.focus.items()[index];
         if (sameWindow(previous.window, snapshot.window) and
             (snapshot.input_revision < previous.input_revision or snapshot.observed_tick < previous.observed_tick or
                 (snapshot.input_revision == previous.input_revision and snapshot.observed_tick == previous.observed_tick and !std.meta.eql(snapshot, previous)))) return false;
         self.updateCompositionFocus(snapshot);
-        self.focus[index] = snapshot;
+        self.focus.items()[index] = snapshot;
         return true;
     }
     pub fn invalidateCompositionFocus(self: *Broker, identity: a.WindowModeIdentity) void {
@@ -303,9 +306,9 @@ pub const Broker = struct {
     }
     pub fn compositionFocus(self: *const Broker, caller: Handle, expected: a.WindowModeIdentity, now: u64, freshness: u64) a.CompositionFocusReply {
         if (!valid(caller) or !same(expected.owner, caller) or !same(expected.service, self.service) or
-            !valid(expected.desktop) or expected.reserved != 0 or expected.serial == 0 or expected.window_id >= self.states.len)
+            !valid(expected.desktop) or expected.reserved != 0 or expected.serial == 0 or expected.window_id >= self.states.view().len)
             return .{ .result = a.composition_error_stale_view };
-        const current_view = self.states[expected.window_id];
+        const current_view = self.states.view()[expected.window_id];
         if (!sameWindow(expected, current_view.window)) return .{ .result = a.composition_error_stale_view };
         const value = self.composition_focus;
         if (value.focused != 1 or !sameWindow(value.window, expected) or value.view_generation != current_view.view_revision or
@@ -315,14 +318,14 @@ pub const Broker = struct {
         return .{ .focus = value };
     }
     pub fn focusSnapshot(self: *const Broker, caller: Handle, expected: a.WindowModeIdentity, now: u64, freshness: u64) a.DesktopFocusReply {
-        if (!valid(caller) or expected.window_id >= self.states.len or (valid(expected.owner) and !same(expected.owner, caller)))
+        if (!valid(caller) or expected.window_id >= self.states.view().len or (valid(expected.owner) and !same(expected.owner, caller)))
             return .{ .result = a.desktop_focus_result_stale };
         const index = expected.window_id;
-        const view = self.states[index];
+        const view = self.states.view()[index];
         if (!same(view.window.owner, caller) or view.window.serial == 0) return .{ .result = a.desktop_focus_result_missing };
         if (expected.serial != 0 and !sameWindow(expected, view.window))
-            return .{ .result = a.desktop_focus_result_stale, .snapshot = self.focus[index] };
-        const snapshot = self.focus[index];
+            return .{ .result = a.desktop_focus_result_stale, .snapshot = self.focus.view()[index] };
+        const snapshot = self.focus.view()[index];
         if (!sameWindow(snapshot.window, view.window) or snapshot.view_revision != view.view_revision or
             snapshot.input_revision == 0 or now < snapshot.observed_tick or now - snapshot.observed_tick > freshness or
             snapshot.focus_state == a.desktop_focus_state_unknown)
@@ -353,7 +356,7 @@ pub const Broker = struct {
         }
         if (pointerKind(request.kind)) {
             const state = self.current(t.window);
-            const focus = self.focus[t.window.window_id];
+            const focus = self.focus.items()[t.window.window_id];
             if (s.pointer_until == 0 or now >= s.pointer_until or request.deadline > s.pointer_until or
                 state.window.serial == 0 or
                 !sameWindow(focus.window, state.window) or focus.view_revision != state.view_revision or
@@ -500,7 +503,7 @@ pub const Broker = struct {
     }
     pub fn appView(self: *const Broker, caller: Handle, window_id: u32) Reply {
         if (!valid(caller) or !valid(self.service) or !nonzero(self.epoch)) return reject(.{}, a.desktop_action_result_unavailable);
-        for (self.states) |state| if (same(state.window.owner, caller) and state.window.window_id == window_id and state.window.serial != 0) {
+        for (self.states.view()) |state| if (same(state.window.owner, caller) and state.window.window_id == window_id and state.window.serial != 0) {
             return .{ .request = .{ .token = .{ .window = state.window, .epoch = self.epoch } }, .current = self.current(state.window) };
         };
         return reject(.{}, a.desktop_action_result_unavailable);
@@ -513,8 +516,8 @@ pub const Broker = struct {
         if (state.view_revision == 0 or state.info.flags & 2 != 0 or request.operation != state.view_revision or request.width != state.info.client_w or request.height != state.info.client_h or
             request.frame_generation <= state.frame_before or request.kind != 0 or request.flags != 0 or request.deadline != 0 or request.x != 0 or request.y != 0) return reject(t, a.desktop_action_result_stale);
         const index = t.window.window_id;
-        if (request.frame_generation > self.candidates[index]) {
-            self.candidates[index] = request.frame_generation;
+        if (request.frame_generation > self.candidates.items()[index]) {
+            self.candidates.items()[index] = request.frame_generation;
             self.revision +|= 1;
         }
         return .{ .request = request, .current = self.current(t.window) };
